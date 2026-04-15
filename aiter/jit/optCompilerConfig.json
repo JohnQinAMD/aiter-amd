@@ -1126,6 +1126,51 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'"
         ]
     },
+    "module_sla_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/sla_lut_abs_to_delta.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/sla_fwd_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/sla_fwd_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-fbracket-depth=1024'",
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/50_sparse_attn'",
+            "f'{CK_DIR}/example/ck_tile'",
+            "f'{CK_DIR}/include/ck_tile/ops/sparse_attn'"
+        ],
+        "verbose": "False",
+        "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
+        "blob_gen_cmd": [
+            "f'{CK_DIR}/example/ck_tile/50_sparse_attn/generate.py -d fwd_vsa --receipt 600 --filter *bf16*nmask* --output_dir {{}}'"
+        ]
+    },
+    "module_sla_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/sla_lut_transpose.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/sla_bwd_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/sla_bwd_pybind.cu'",
+            "f'{CK_DIR}/example/ck_tile/50_sparse_attn/vsa_sparse_attention_bwd.cpp'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-fbracket-depth=1024'",
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/50_sparse_attn'",
+            "f'{CK_DIR}/example/ck_tile'",
+            "f'{CK_DIR}/include/ck_tile/ops/sparse_attn'"
+        ],
+        "verbose": "False",
+        "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
+        "blob_gen_cmd": []
+    },
     "module_mha_varlen_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
