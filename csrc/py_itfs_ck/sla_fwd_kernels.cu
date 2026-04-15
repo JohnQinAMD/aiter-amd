@@ -68,8 +68,11 @@ std::vector<at::Tensor> sla_fwd(at::Tensor q,             // [B, H, S, D]
     const int64_t D = q.size(3);
 
     TORCH_CHECK(D == 128, "sla_fwd: head dim must be 128 (CK VSA only builds d=128)");
-    TORCH_CHECK(block_m == 128 && block_n == 64,
-                "sla_fwd: only (block_m=128, block_n=64) is supported in the current CK build");
+    // Option 2: accept block_m in {64, 128}. The codegen now builds
+    // both (kM0=64, kN0=64) and (kM0=128, kN0=64) tile instances;
+    // args.block_m selects at runtime via the seqtune dispatcher.
+    TORCH_CHECK((block_m == 64 || block_m == 128) && block_n == 64,
+                "sla_fwd: block_m must be 64 or 128, block_n must be 64");
 
     const int64_t M_BLOCKS = (S + block_m - 1) / block_m;
     const int64_t K_BLOCKS = (S + block_n - 1) / block_n;
@@ -196,6 +199,11 @@ std::vector<at::Tensor> sla_fwd(at::Tensor q,             // [B, H, S, D]
     args.window_size_left  = -1;
     args.window_size_right = -1;
     args.mask_type         = 0; // mask_enum::no_mask
+
+    // Option 2: tile-size hint for the codegen dispatcher. block_m=64
+    // selects the (kM0=64) tile (Config A/B), block_m=128 selects the
+    // (kM0=128) tile (Config C).
+    args.block_m = static_cast<ck_tile::index_t>(block_m);
 
     fmha_vsa_fwd_traits traits{};
     traits.hdim_q        = static_cast<int>(D);
