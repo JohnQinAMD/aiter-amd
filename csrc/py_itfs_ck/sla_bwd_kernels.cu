@@ -85,8 +85,12 @@ std::vector<at::Tensor> sla_bwd(at::Tensor dout,
     const int64_t S = q.size(2);
     const int64_t D = q.size(3);
     TORCH_CHECK(D == 128, "sla_bwd: only D=128 supported");
-    TORCH_CHECK(block_m == 128 && block_n == 64,
-                "sla_bwd: only (block_m=128, block_n=64) supported");
+    // Option 1: accept block_m in {64, 128} so Config A/B (BLKQ=64) can
+    // dispatch to the CK bwd. The CK pipeline is instantiated at kM0=64,
+    // and the q_scale = block_m / VSA_BWD_KM0 computation below handles
+    // both cases (q_scale=1 for BLKQ=64, q_scale=2 for BLKQ=128).
+    TORCH_CHECK((block_m == 64 || block_m == 128) && block_n == 64,
+                "sla_bwd: block_m must be 64 or 128, block_n must be 64");
 
     const int64_t M_BLOCKS = (S + block_m - 1) / block_m;
     const int64_t K_BLOCKS = (S + block_n - 1) / block_n;
