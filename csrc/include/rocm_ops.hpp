@@ -867,6 +867,20 @@ namespace py = pybind11;
           py::arg("sink_ptr")      = std::nullopt, \
           py::arg("gen")           = std::nullopt);
 
+#define SLA_FWD_PYBIND                                 \
+    m.def("sla_fwd",                                   \
+          &aiter::torch_itfs::sla_fwd,                 \
+          py::arg("q"),                                \
+          py::arg("k"),                                \
+          py::arg("v"),                                \
+          py::arg("lut"),                              \
+          py::arg("block_m"),                          \
+          py::arg("block_n"),                          \
+          py::arg("softmax_scale"),                    \
+          py::arg("valid_block_num") = std::nullopt,   \
+          py::arg("out")             = std::nullopt,   \
+          "SLA sparse attention forward via CK-tile VSA kernel");
+
 #define LIBMHA_FWD_PYBIND                          \
     m.def("libmha_fwd",                            \
           &aiter::torch_itfs::mha_fwd,             \
