@@ -20,4 +20,14 @@ void qr_all_reduce(fptr_t _fa,
                    bool cast_bf2half = false);
 int64_t qr_max_size();
 
+void qr_fused_allreduce_rmsnorm(fptr_t _fa,
+                                 torch::Tensor& inp,
+                                 torch::Tensor& out,
+                                 torch::Tensor& residual_in,
+                                 torch::Tensor& residual_out,
+                                 torch::Tensor& rms_weight,
+                                 double rms_epsilon,
+                                 int64_t quant_level,
+                                 bool cast_bf2half = false);
+
 } // namespace aiter

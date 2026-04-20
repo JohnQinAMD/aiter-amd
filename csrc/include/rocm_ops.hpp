@@ -1369,7 +1369,18 @@ namespace py = pybind11;
           "qr_open_handles(int fa, Tensor[] handles)",                                     \
           py::arg("fa"),                                                                   \
           py::arg("handles"));                                                             \
-    m.def("qr_max_size", &aiter::qr_max_size);
+    m.def("qr_max_size", &aiter::qr_max_size);                                          \
+    m.def("qr_fused_allreduce_rmsnorm",                                                    \
+          &aiter::qr_fused_allreduce_rmsnorm,                                              \
+          py::arg("fa"),                                                                    \
+          py::arg("inp"),                                                                   \
+          py::arg("out"),                                                                   \
+          py::arg("residual_in"),                                                           \
+          py::arg("residual_out"),                                                          \
+          py::arg("rms_weight"),                                                            \
+          py::arg("rms_epsilon"),                                                           \
+          py::arg("quant_level"),                                                           \
+          py::arg("cast_bf2half") = false);
 
 #define RMSNORM_PYBIND                                                                             \
     m.def("rms_norm_cu",                                                                           \

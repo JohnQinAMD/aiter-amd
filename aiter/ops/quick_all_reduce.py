@@ -40,3 +40,17 @@ def qr_open_handles(fa: int, handles: list[torch.Tensor]) -> None: ...
 
 @compile_ops("module_quick_all_reduce")
 def qr_max_size() -> int: ...
+
+
+@compile_ops("module_quick_all_reduce")
+def qr_fused_allreduce_rmsnorm(
+    fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    residual_in: torch.Tensor,
+    residual_out: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_epsilon: float,
+    quant_level: int,
+    cast_bf2half: bool = False,
+) -> None: ...
