@@ -535,9 +535,15 @@ __global__ __launch_bounds__(NUM_THREADS,5) void paged_attention_ll4mi_QKV_mfma1
     const scalar_t* q_ptr = q + seq_idx64 * q_stride + global_qhead_idx * HEAD_SIZE; //+ rowid * CONTIGUOUS_KV_ELEMS_16B_LOAD;
 
     if (local_qhead_idx < GQA_RATIO) {
-        const scalar_t* q_fetch_ptr = q_ptr + lane16id * CONTIGUOUS_SCALAR_ELEMS_16B; //this works for head size 128 : 16 lanes x 8 elems = 128 elems
-        const _B16x8* q_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(q_fetch_ptr);
-        _B16x8 tmp = *q_fetch_ptr_16B; 
+        const int q_lane_offset = lane16id * CONTIGUOUS_SCALAR_ELEMS_16B;
+        _B16x8 tmp;
+        tmp.xy[0] = {0};
+        tmp.xy[1] = {0};
+        if (q_lane_offset < HEAD_SIZE) {
+            const scalar_t* q_fetch_ptr = q_ptr + q_lane_offset;
+            const _B16x8* q_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(q_fetch_ptr);
+            tmp = *q_fetch_ptr_16B;
+        }
         if constexpr (KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto) {
             const int offset1 = lane16id/4; //16 contiguous chunks of head elems are spread across 4x4lanes
             shared_logits[offset1][lane4id][local_qhead_idx][0] = tmp.xy[0];
@@ -551,7 +557,7 @@ __global__ __launch_bounds__(NUM_THREADS,5) void paged_attention_ll4mi_QKV_mfma1
                 shared_logits[offset1][offset2][local_qhead_idx][offset3] = tmp.xy[i];
             }
         }
-    } 
+    }
     __syncthreads();
     for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
         for (int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++) {
@@ -1165,15 +1171,22 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
         q + seq_idx * q_stride + wg_start_head_idx * HEAD_SIZE;
     const _B16x8* q_ptrh8 = reinterpret_cast<const _B16x8*>(q_ptr);
     const int qhead_elemh8 = laneid / 4;
+    constexpr int HEAD_SIZE_HE = HEAD_SIZE / 8;  // _B16x8 chunks per head
+    const bool elem_in_head = qhead_elemh8 < HEAD_SIZE_HE;
   #pragma unroll
     for (int h = 0; h < QHLOOP - 1; h++) {
       const int qhead_idx = h * 4 + lane4id;
-      Qlocal[h] = q_ptrh8[qhead_idx * HEAD_SIZE / 8 + qhead_elemh8];
+      if (elem_in_head) {
+        Qlocal[h] = q_ptrh8[qhead_idx * HEAD_SIZE_HE + qhead_elemh8];
+      } else {
+        Qlocal[h].xy[0] = {0};
+        Qlocal[h].xy[1] = {0};
+      }
     }
     const int final_qhead_idx = 4 * (QHLOOP - 1) + lane4id;
-    if (final_qhead_idx < GQA_RATIO) {
+    if (final_qhead_idx < GQA_RATIO && elem_in_head) {
       Qlocal[QHLOOP - 1] =
-          q_ptrh8[final_qhead_idx * HEAD_SIZE / 8 + qhead_elemh8];
+          q_ptrh8[final_qhead_idx * HEAD_SIZE_HE + qhead_elemh8];
     } else {
       Qlocal[QHLOOP - 1].xy[0] = {0};
       Qlocal[QHLOOP - 1].xy[1] = {0};
