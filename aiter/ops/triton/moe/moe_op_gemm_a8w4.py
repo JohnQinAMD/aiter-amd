@@ -89,15 +89,30 @@ def get_kernel_config(m, n, k, routing_data):
             grid = grid_m * grid_n * split_k
 
     elif block_m == 32:
-        if n <= 1024:
-            block_n = 128
-            num_warps = 4
-        elif n <= 4096:
-            block_n = 256
-            num_warps = 8
+        if arch == "gfx950":
+            group_m = 4 if m >= 4096 else 1
+            if n <= 1024:
+                block_n = 128
+                num_warps = 4
+            elif n <= 4096:
+                block_n = 256
+                num_warps = 4
+            elif m < 1024:
+                block_n = 128
+                num_warps = 4
+            else:
+                block_n = 512
+                num_warps = 4
         else:
-            block_n = 512
-            num_warps = 8
+            if n <= 1024:
+                block_n = 128
+                num_warps = 4
+            elif n <= 4096:
+                block_n = 256
+                num_warps = 8
+            else:
+                block_n = 512
+                num_warps = 8
 
     else:
         block_n = 512
