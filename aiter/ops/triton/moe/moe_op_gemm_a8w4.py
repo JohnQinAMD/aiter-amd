@@ -94,14 +94,14 @@ def get_kernel_config(m, n, k, routing_data):
             num_warps = 4
         elif n <= 4096:
             block_n = 256
-            num_warps = 4 if arch == "gfx950" else 8
+            num_warps = 4
         else:
             block_n = 512
-            num_warps = 4 if arch == "gfx950" else 8
+            num_warps = 4
 
     else:
         block_n = 512
-        num_warps = 4 if (block_m == 128 and arch == "gfx950") else 8
+        num_warps = 4 if block_m == 128 else 8
 
     ret = {
         "block_m": block_m,
