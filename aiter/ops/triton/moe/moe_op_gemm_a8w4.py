@@ -101,6 +101,8 @@ def get_kernel_config(m, n, k, routing_data):
 
     else:
         block_n = 512
+        # routing caps block_m at 128; nw=4 wins ~2x at block_m=128 on gpt-oss
+        # shapes (MI355X) but regresses ~7% at block_m=64, so 64 stays at 8.
         num_warps = 4 if block_m == 128 else 8
 
     ret = {
