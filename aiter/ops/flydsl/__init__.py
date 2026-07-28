@@ -37,6 +37,7 @@ if is_flydsl_available():
             f"got `{installed_flydsl_version}`."
         )
 
+    from .latent_moe_tail import latent_moe_tail, supports_latent_moe_tail
     from .fmha_kernels import flydsl_flash_attn_func
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
     from .kernels.fp8_mqa_logits import (
@@ -70,6 +71,8 @@ if is_flydsl_available():
         "flydsl_hgemm",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
+        "latent_moe_tail",
+        "supports_latent_moe_tail",
         "flydsl_pa_mqa_logits_fp4",
         "flydsl_pa_mqa_logits_fp4_prefill",
         "flydsl_pa_mqa_logits_fp4_varqlen",
