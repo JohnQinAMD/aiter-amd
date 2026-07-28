@@ -117,6 +117,62 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
     }
 }
 
+static void _all_reduce_dual(fptr_t _fa,
+                             void* left,
+                             void* right,
+                             void* left_out,
+                             void* right_out,
+                             int64_t left_numel,
+                             int64_t right_numel,
+                             AiterDtype dtype,
+                             void* staging,
+                             int64_t staging_bytes)
+{
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    switch(dtype)
+    {
+    case AITER_DTYPE_fp32:
+        fa->allreduceDual<opus::fp32_t>(stream,
+                                       reinterpret_cast<opus::fp32_t*>(left),
+                                       reinterpret_cast<opus::fp32_t*>(right),
+                                       reinterpret_cast<opus::fp32_t*>(left_out),
+                                       reinterpret_cast<opus::fp32_t*>(right_out),
+                                       left_numel,
+                                       right_numel,
+                                       reinterpret_cast<opus::fp32_t*>(staging),
+                                       staging_bytes);
+        break;
+    case AITER_DTYPE_fp16:
+        fa->allreduceDual<opus::fp16_t>(stream,
+                                       reinterpret_cast<opus::fp16_t*>(left),
+                                       reinterpret_cast<opus::fp16_t*>(right),
+                                       reinterpret_cast<opus::fp16_t*>(left_out),
+                                       reinterpret_cast<opus::fp16_t*>(right_out),
+                                       left_numel,
+                                       right_numel,
+                                       reinterpret_cast<opus::fp16_t*>(staging),
+                                       staging_bytes);
+        break;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case AITER_DTYPE_bf16:
+        fa->allreduceDual<opus::bf16_t>(stream,
+                                       reinterpret_cast<opus::bf16_t*>(left),
+                                       reinterpret_cast<opus::bf16_t*>(right),
+                                       reinterpret_cast<opus::bf16_t*>(left_out),
+                                       reinterpret_cast<opus::bf16_t*>(right_out),
+                                       left_numel,
+                                       right_numel,
+                                       reinterpret_cast<opus::bf16_t*>(staging),
+                                       staging_bytes);
+        break;
+#endif
+    default:
+        throw std::runtime_error(
+            "dual-input custom allreduce only supports float32, float16, and bfloat16");
+    }
+}
+
 static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
                             int m, int n, int k,
                             aiter::ReduceScatterSplitDim split_dim,
@@ -438,6 +494,53 @@ void all_reduce(fptr_t _fa,
 
     _all_reduce(_fa, actual_inp, actual_out, numel, dtype,
                 use_new, open_fp8_quant, is_broadcast_reg_outptr);
+}
+
+void all_reduce_dual(fptr_t _fa,
+                     const aiter_tensor_t& left,
+                     const aiter_tensor_t& right,
+                     const aiter_tensor_t& left_out,
+                     const aiter_tensor_t& right_out,
+                     int64_t staging_ptr,
+                     int64_t staging_bytes)
+{
+    if(left.device_id != right.device_id || left.device_id != left_out.device_id ||
+       left.device_id != right_out.device_id)
+        throw std::runtime_error(
+            "dual-input custom allreduce tensors must be on the same device");
+    if(left.dtype() != right.dtype() || left.dtype() != left_out.dtype() ||
+       left.dtype() != right_out.dtype())
+        throw std::runtime_error(
+            "dual-input custom allreduce tensors must have the same dtype");
+    if(left.numel() != left_out.numel() || right.numel() != right_out.numel())
+        throw std::runtime_error(
+            "dual-input custom allreduce output sizes must match their inputs");
+    if(!left.is_contiguous() || !right.is_contiguous() || !left_out.is_contiguous() ||
+       !right_out.is_contiguous())
+        throw std::runtime_error(
+            "dual-input custom allreduce tensors must be contiguous");
+    if(left_out.data_ptr() == left.data_ptr() || left_out.data_ptr() == right.data_ptr() ||
+       right_out.data_ptr() == left.data_ptr() ||
+       right_out.data_ptr() == right.data_ptr() ||
+       left_out.data_ptr() == right_out.data_ptr())
+        throw std::runtime_error(
+            "dual-input custom allreduce outputs must not alias inputs or each other");
+    if(staging_ptr == 0 ||
+       staging_bytes < static_cast<int64_t>(left.numel() * left.element_size()))
+        throw std::runtime_error(
+            "dual-input custom allreduce staging buffer is too small");
+
+    HipDeviceGuard device_guard(left.device_id);
+    _all_reduce_dual(_fa,
+                     left.data_ptr(),
+                     right.data_ptr(),
+                     left_out.data_ptr(),
+                     right_out.data_ptr(),
+                     left.numel(),
+                     right.numel(),
+                     left.dtype(),
+                     reinterpret_cast<void*>(staging_ptr),
+                     staging_bytes);
 }
 
 void reduce_scatter(fptr_t _fa,

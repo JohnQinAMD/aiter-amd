@@ -642,7 +642,6 @@ class _GFX1250BufferProxy:
 
 
 class CustomAllreduce:
-
     _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 6, 8]
 
     def _select_ops(self):
@@ -664,6 +663,7 @@ class CustomAllreduce:
             # kernel ops (arch)
             self._ops_meta_size = ops.meta_size_gfx1250
             self._ops_all_reduce = ops.all_reduce_gfx1250
+            self._ops_all_reduce_dual = None
             self._ops_all_gather = ops.all_gather_gfx1250
             self._ops_reduce_scatter = ops.reduce_scatter_gfx1250
             self._ops_dispose = ops.dispose_gfx1250
@@ -685,6 +685,7 @@ class CustomAllreduce:
             self._ops_meta_size = ops.meta_size
             self._ops_init_custom_ar = ops.init_custom_ar
             self._ops_all_reduce = ops.all_reduce
+            self._ops_all_reduce_dual = ops.all_reduce_dual
             self._ops_all_gather = None
             self._ops_reduce_scatter = ops.reduce_scatter
             self._ops_dispose = ops.dispose
@@ -725,9 +726,9 @@ class CustomAllreduce:
 
         self.group = group
 
-        assert (
-            dist.get_backend(group) != dist.Backend.NCCL
-        ), "CustomAllreduce should be attached to a non-NCCL group."
+        assert dist.get_backend(group) != dist.Backend.NCCL, (
+            "CustomAllreduce should be attached to a non-NCCL group."
+        )
 
         if not all(in_the_same_node_as(group, source_rank=0)):
             # No need to initialize custom allreduce for multi-node case.
@@ -1062,6 +1063,32 @@ class CustomAllreduce:
             inp
         )
 
+    def should_custom_ar_dual(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+    ) -> bool:
+        """Return whether two registered inputs fit the one-stage dual kernel."""
+        if self.disabled or self._ops_all_reduce_dual is None:
+            return False
+        if left.numel() == 0 or right.numel() == 0:
+            return False
+        if left.device != right.device or left.dtype != right.dtype:
+            return False
+        if left.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            return False
+        if not left.is_contiguous() or not right.is_contiguous():
+            return False
+        left_bytes = left.numel() * left.element_size()
+        right_bytes = right.numel() * right.element_size()
+        if left_bytes % 16 != 0 or right_bytes % 16 != 0:
+            return False
+        total_bytes = left_bytes + right_bytes
+        if not self._car_min_size < total_bytes <= self._car_max_size:
+            return False
+        one_stage_limit = 160 * 1024 if self.world_size <= 4 else 80 * 1024
+        return self.fully_connected and total_bytes < one_stage_limit
+
     def should_custom_ar_bytes(self, inp: torch.Tensor, prefill_support: bool = False):
         """Return whether the tensor size fits custom AR even if it is strided.
 
@@ -1144,6 +1171,48 @@ class CustomAllreduce:
                 open_fp8_quant=open_fp8_quant,
                 registered_input=False,
             )
+
+    def all_reduce_dual(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        *,
+        left_out: torch.Tensor | None = None,
+        right_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce two separately registered inputs in one one-stage launch."""
+        if left_out is None:
+            left_out = torch.empty_like(left)
+        if right_out is None:
+            right_out = torch.empty_like(right)
+        if not left_out.is_contiguous() or not right_out.is_contiguous():
+            raise ValueError("dual-input custom allreduce outputs must be contiguous")
+        if self._ops_all_reduce_dual is None:
+            raise RuntimeError("dual-input custom allreduce is unavailable")
+        self._ops_all_reduce_dual(
+            self._ptr,
+            left,
+            right,
+            left_out,
+            right_out,
+            self._pool["input"].data_ptr,
+            self._pool["input"].max_size,
+        )
+        return left_out, right_out
+
+    def custom_all_reduce_dual(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Use the graph-registered dual kernel or return ``None`` for fallback."""
+        if not self.should_custom_ar_dual(left, right):
+            return None
+        if not self._IS_CAPTURING:
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            return self.all_reduce_dual(left, right)
+        return torch.zeros_like(left), torch.zeros_like(right)
 
     # reduce_scatter split_dim enum — must match `aiter::ReduceScatterSplitDim`
     # in csrc/include/custom_all_reduce.cuh.
