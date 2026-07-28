@@ -256,7 +256,34 @@ def get_flydsl_stage1_kernels(
                                             "xcd_swizzle": xcd,
                                             "k_wave": kw,
                                         }
+    _register_production_variants_stage1(kernels, a_dtype, b_dtype, out_dtype)
     return kernels
+
+
+def _register_production_variants_stage1(
+    kernels: Dict[str, Dict], a_dtype: str, b_dtype: str, out_dtype: str
+) -> None:
+    """Append hand-tuned stage1 variants to ``kernels`` in-place."""
+    if (a_dtype, b_dtype, out_dtype) != ("bf16", "fp4", "bf16"):
+        return
+
+    name = "flydsl_moe1_abf16_wfp4_bf16_t16x64x256_w3_xcd4"
+    kernels[name] = {
+        "stage": 1,
+        "a_dtype": a_dtype,
+        "b_dtype": b_dtype,
+        "out_dtype": out_dtype,
+        "tile_m": 16,
+        "tile_n": 64,
+        "tile_k": 256,
+        "MPerBlock": 16,
+        "waves_per_eu": 3,
+        "k_batch": 1,
+        "b_nt": 2,
+        "gate_mode": "separated",
+        "xcd_swizzle": 4,
+        "k_wave": 1,
+    }
 
 
 def get_flydsl_stage2_kernels(
