@@ -36,6 +36,18 @@ def all_reduce(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def all_reduce_dual(
+    _fa: int,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    left_out: torch.Tensor,
+    right_out: torch.Tensor,
+    staging_ptr: int,
+    staging_bytes: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def reduce_scatter(
     _fa: int,
     inp: torch.Tensor,
