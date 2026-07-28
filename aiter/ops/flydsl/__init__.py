@@ -42,6 +42,7 @@ if is_flydsl_available():
     from .fmha_kernels import flydsl_flash_attn_func
     from .kimi_k3_kda_decode import (
         flydsl_kimi_k3_kda_decode,
+        flydsl_kimi_k3_kda_decode_with_f_b,
         is_flydsl_kimi_k3_kda_decode_supported,
     )
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
@@ -66,6 +67,7 @@ if is_flydsl_available():
         "flydsl_hgemm",
         "flydsl_flash_attn_func",
         "flydsl_kimi_k3_kda_decode",
+        "flydsl_kimi_k3_kda_decode_with_f_b",
         "is_flydsl_kimi_k3_kda_decode_supported",
         "flydsl_qk_norm_rope_quant",
         "flydsl_pa_mqa_logits_fp4",
