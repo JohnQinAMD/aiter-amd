@@ -41,6 +41,7 @@ if is_flydsl_available():
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
     from .kimi_k3_kda_decode import (
         flydsl_kimi_k3_kda_decode,
+        flydsl_kimi_k3_kda_decode_with_f_b,
         is_flydsl_kimi_k3_kda_decode_supported,
     )
     from .kernels.fp8_mqa_logits import (
@@ -74,6 +75,7 @@ if is_flydsl_available():
         "flydsl_fp8_mqa_logits",
         "flydsl_hgemm",
         "flydsl_kimi_k3_kda_decode",
+        "flydsl_kimi_k3_kda_decode_with_f_b",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "is_flydsl_kimi_k3_kda_decode_supported",
