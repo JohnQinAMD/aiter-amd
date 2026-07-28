@@ -5509,7 +5509,10 @@ def compile_mixed_moe_gemm1_a16w4(
             by = gpu.block_id("x")
             bx = gpu.block_id("y")
 
-            bx_m = bx * arith.index(tile_m)
+            # Route metadata remains in the standard 32-row expert buckets
+            # even when the B1 direct path issues a native 16-row MFMA tile.
+            # Advance by the producer's bucket stride, not the compute tile.
+            bx_m = bx * arith.index(sort_block_m)
             numids_rsrc = ptr_buffer_resource(
                 arg_num_valid_ids, arith.constant(4, type=i32)
             )
