@@ -37,9 +37,12 @@ if is_flydsl_available():
             f"got `{installed_flydsl_version}`."
         )
 
-    from .latent_moe_tail import latent_moe_tail, supports_latent_moe_tail
     from .fmha_kernels import flydsl_flash_attn_func
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
+    from .kimi_k3_kda_decode import (
+        flydsl_kimi_k3_kda_decode,
+        is_flydsl_kimi_k3_kda_decode_supported,
+    )
     from .kernels.fp8_mqa_logits import (
         DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
     )
@@ -49,6 +52,7 @@ if is_flydsl_available():
     from .kernels.fp8_mqa_logits import (
         flydsl_fp8_mqa_logits,
     )
+    from .latent_moe_tail import latent_moe_tail, supports_latent_moe_tail
     from .kernels.pa_mqa_logits_fp4 import (
         flydsl_pa_mqa_logits_fp4,
     )
@@ -69,8 +73,10 @@ if is_flydsl_available():
         "flydsl_flash_attn_func",
         "flydsl_fp8_mqa_logits",
         "flydsl_hgemm",
+        "flydsl_kimi_k3_kda_decode",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
+        "is_flydsl_kimi_k3_kda_decode_supported",
         "latent_moe_tail",
         "supports_latent_moe_tail",
         "flydsl_pa_mqa_logits_fp4",
