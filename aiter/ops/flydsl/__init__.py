@@ -38,6 +38,7 @@ if is_flydsl_available():
         )
 
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
+    from .latent_moe_tail import latent_moe_tail, supports_latent_moe_tail
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from .fmha_kernels import flydsl_flash_attn_func
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
@@ -60,6 +61,8 @@ if is_flydsl_available():
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "flydsl_hgemm",
+        "latent_moe_tail",
+        "supports_latent_moe_tail",
         "flydsl_flash_attn_func",
         "flydsl_qk_norm_rope_quant",
         "flydsl_pa_mqa_logits_fp4",
