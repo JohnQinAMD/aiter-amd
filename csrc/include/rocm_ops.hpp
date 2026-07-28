@@ -494,6 +494,15 @@ namespace py = pybind11;
           py::arg("open_fp8_quant"),                                                           \
           py::arg("reg_inp_ptr"),                                                              \
           py::arg("reg_inp_bytes"));                                                           \
+    m.def("all_reduce_dual",                                                                   \
+          &aiter::all_reduce_dual,                                                             \
+          py::arg("_fa"),                                                                      \
+          py::arg("left"),                                                                     \
+          py::arg("right"),                                                                    \
+          py::arg("left_out"),                                                                 \
+          py::arg("right_out"),                                                                \
+          py::arg("staging_ptr"),                                                              \
+          py::arg("staging_bytes"));                                                           \
     m.def("reduce_scatter",                                                                    \
           &aiter::reduce_scatter,                                                              \
           py::arg("_fa"),                                                                      \
