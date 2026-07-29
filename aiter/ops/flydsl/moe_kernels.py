@@ -255,7 +255,22 @@ def get_flydsl_stage1_kernels(
                                             "xcd_swizzle": xcd,
                                             "k_wave": kw,
                                         }
+    _register_production_variants_stage1(kernels, a_dtype, b_dtype, out_dtype)
     return kernels
+
+
+def _register_production_variants_stage1(
+    kernels: dict[str, dict], a_dtype: str, b_dtype: str, out_dtype: str
+) -> None:
+    """Append independently validated stage1 variants to ``kernels`` in-place."""
+
+    if (a_dtype, b_dtype, out_dtype) != ("fp8", "fp4", "bf16"):
+        return
+
+    base = flydsl_kernel_name(1, a_dtype, b_dtype, out_dtype, 32, 64, 256) + "_gui"
+    if base not in kernels:
+        return
+    kernels[base + "_kw7"] = {**kernels[base], "k_wave": 7}
 
 
 def get_flydsl_stage2_kernels(
@@ -1975,15 +1990,14 @@ def flydsl_moe_fused_route_quant_scatter(
     numel = token_num * topk
     model_dim = hidden_states.shape[-1]
     rows_per_tile = wmma_rep * 16
-    assert (
-        max_m % rows_per_tile == 0
-    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    assert max_m % rows_per_tile == 0, (
+        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
 
     out_E = E if out_E is None else int(out_E)
     out_max_m = max_m if out_max_m is None else int(out_max_m)
     assert out_max_m % rows_per_tile == 0, (
-        f"out_max_m ({out_max_m}) must be a multiple of wmma_rep*16 "
-        f"({rows_per_tile})"
+        f"out_max_m ({out_max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
     )
 
     payload_bytes_per_row = model_dim if quant_mode == "fp8" else model_dim // 2
@@ -2287,15 +2301,14 @@ def flydsl_moe_fused_quant_preshuffle(
             "unsupported (expected 'fp4' or 'fp8')."
         )
     assert grouped_in.dtype == torch.bfloat16, (
-        "fused grouped quant+preshuffle requires bf16 input "
-        f"(got {grouped_in.dtype})"
+        f"fused grouped quant+preshuffle requires bf16 input (got {grouped_in.dtype})"
     )
     device = grouped_in.device
     feat_dim = grouped_in.shape[-1]
     rows_per_tile = wmma_rep * 16
-    assert (
-        max_m % rows_per_tile == 0
-    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    assert max_m % rows_per_tile == 0, (
+        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
 
     n_rows = E * max_m
     Pb = feat_dim if quant_mode == "fp8" else feat_dim // 2
