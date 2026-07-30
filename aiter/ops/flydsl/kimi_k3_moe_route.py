@@ -16,6 +16,7 @@ class KimiK3RouteSortDispatch(enum.Enum):
     """Dispatch decision for the fixed production-shape specialization."""
 
     FLYDSL_GFX950_B1 = "flydsl_gfx950_b1"
+    PREPARED_MXFP4_GFX950_B1 = "prepared_mxfp4_gfx950_b1"
     UNSUPPORTED = "unsupported"
 
 
@@ -30,7 +31,7 @@ KimiK3RouteSortResult = tuple[
 ]
 
 
-def supports_kimi_k3_b1_route_sort(
+def _supports_route_tensor_contract(
     logits: torch.Tensor,
     correction_bias: torch.Tensor,
     *,
@@ -62,20 +63,51 @@ def supports_kimi_k3_b1_route_sort(
     )
 
 
-def kimi_k3_route_sort_dispatch(
-    logits: torch.Tensor,
-    correction_bias: torch.Tensor,
+def supports_kimi_k3_b1_route_sort(
+    logits_or_request: object,
+    correction_bias: torch.Tensor | None = None,
     *,
-    num_experts: int,
-    topk: int,
-    num_expert_group: int,
-    topk_group: int,
-    block_size_m: int,
+    num_experts: int | None = None,
+    topk: int | None = None,
+    num_expert_group: int | None = None,
+    topk_group: int | None = None,
+    block_size_m: int | None = None,
+) -> bool:
+    """Own every support check for primitive and production dispatch."""
+
+    if not isinstance(logits_or_request, torch.Tensor):
+        from aiter.ops.flydsl.kimi_k3_moe_handoff import (
+            _supports_kimi_k3_b1_route_sort_request,
+        )
+
+        return _supports_kimi_k3_b1_route_sort_request(logits_or_request)
+    if not isinstance(correction_bias, torch.Tensor):
+        return False
+    return _supports_route_tensor_contract(
+        logits_or_request,
+        correction_bias,
+        num_experts=num_experts or 0,
+        topk=topk or 0,
+        num_expert_group=num_expert_group or 0,
+        topk_group=topk_group or 0,
+        block_size_m=block_size_m or 0,
+    )
+
+
+def kimi_k3_route_sort_dispatch(
+    logits_or_request: object,
+    correction_bias: torch.Tensor | None = None,
+    *,
+    num_experts: int | None = None,
+    topk: int | None = None,
+    num_expert_group: int | None = None,
+    topk_group: int | None = None,
+    block_size_m: int | None = None,
 ) -> KimiK3RouteSortDispatch:
     """Choose the named route+sort implementation without changing fallbacks."""
 
     if supports_kimi_k3_b1_route_sort(
-        logits,
+        logits_or_request,
         correction_bias,
         num_experts=num_experts,
         topk=topk,
@@ -83,7 +115,11 @@ def kimi_k3_route_sort_dispatch(
         topk_group=topk_group,
         block_size_m=block_size_m,
     ):
-        return KimiK3RouteSortDispatch.FLYDSL_GFX950_B1
+        return (
+            KimiK3RouteSortDispatch.FLYDSL_GFX950_B1
+            if isinstance(logits_or_request, torch.Tensor)
+            else KimiK3RouteSortDispatch.PREPARED_MXFP4_GFX950_B1
+        )
     return KimiK3RouteSortDispatch.UNSUPPORTED
 
 

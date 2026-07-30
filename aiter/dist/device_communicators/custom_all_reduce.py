@@ -18,7 +18,7 @@
 import os
 import pickle
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -27,9 +27,10 @@ from torch.distributed import ProcessGroup
 # import vllm.envs as envs
 # from vllm import _custom_ops as ops
 import aiter as ops
-from aiter.dist.parallel_state import in_the_same_node_as
 from aiter import logger
+from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.utility.dtypes import fp8
+
 from .rocm_version import get_rocm_version
 
 
@@ -49,7 +50,7 @@ def _detect_gfx1250() -> bool:
             return False
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         return "gfx1250" in getattr(props, "gcnArchName", "")
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -228,7 +229,7 @@ try:
     else:
         ops.meta_size()
     custom_ar = True
-except Exception as e:
+except Exception as e:  # noqa: BLE001
     # For CPUs
     custom_ar = False
     logger.warning(f"Custom allreduce is disabled: {e}")
@@ -435,7 +436,7 @@ class IPCBufferPool:
         self._group = group
         self._rank = dist.get_rank(group=group)
         self._world_size = dist.get_world_size(group=group)
-        self._buffers: Dict[str, IPCBuffer] = {}
+        self._buffers: dict[str, IPCBuffer] = {}
         self._ipc_handle_fn = ipc_handle_fn or ops.get_meta_buffer_ipc_handle
         self._graph_count_fn = graph_count_fn or ops.get_graph_buffer_count
         self._graph_ipc_meta_fn = graph_ipc_meta_fn or ops.get_graph_buffer_ipc_meta
@@ -496,14 +497,14 @@ class IPCBufferPool:
 
     # ---- Eager mode: named buffer IPC meta ----
 
-    def get_ipc_meta(self, key: str) -> Tuple[List, List]:
+    def get_ipc_meta(self, key: str) -> tuple[list, list]:
         """Broadcast IPC handles for the named buffer across all ranks."""
         buf = self._buffers[key]
         return self._broadcast_ipc(buf.data_ptr)
 
     # ---- Graph mode: external buffer IPC meta ----
 
-    def get_external_ipc_meta(self, tensor: torch.Tensor) -> Tuple[List, List]:
+    def get_external_ipc_meta(self, tensor: torch.Tensor) -> tuple[list, list]:
         """Broadcast IPC handles for an arbitrary external tensor."""
         return self._broadcast_ipc(tensor.data_ptr())
 
@@ -531,13 +532,13 @@ class IPCBufferPool:
 
     # ---- Private IPC primitives ----
 
-    def _broadcast_ipc(self, data_ptr: int) -> Tuple[List, List]:
+    def _broadcast_ipc(self, data_ptr: int) -> tuple[list, list]:
         """Get IPC handle for *data_ptr* and broadcast across all ranks."""
         handle = torch.empty(64, dtype=torch.uint8)  # sizeof(hipIpcMemHandle_t)
         self._ipc_handle_fn(data_ptr, handle.data_ptr())
         return self._gather_ipc_meta((handle, 0))
 
-    def _gather_ipc_meta(self, shard_data) -> Tuple[List, List]:
+    def _gather_ipc_meta(self, shard_data) -> tuple[list, list]:
         """Exchange IPC metadata (handle + offset) across all ranks via TCP store.
 
         Each rank writes its serialised *shard_data* under a unique key, then
@@ -603,8 +604,9 @@ class _GFX1250BufferProxy:
 
     def get_external_ipc_meta(self, tensor):
         """Exchange a tensor's pointer across ranks using VMM."""
-        from .vmm_allocator import VMMBuffer, vmm_exchange, load_hip_runtime
         import torch.distributed as dist
+
+        from .vmm_allocator import VMMBuffer, load_hip_runtime, vmm_exchange
 
         ca = self._ca
         store = dist.distributed_c10d._get_default_store()
@@ -640,8 +642,7 @@ class _GFX1250BufferProxy:
 
 
 class CustomAllreduce:
-
-    _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
+    _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 6, 8]
 
     def _select_ops(self):
         """Select the ops backend.
@@ -662,6 +663,7 @@ class CustomAllreduce:
             # kernel ops (arch)
             self._ops_meta_size = ops.meta_size_gfx1250
             self._ops_all_reduce = ops.all_reduce_gfx1250
+            self._ops_all_reduce_dual = None
             self._ops_all_gather = ops.all_gather_gfx1250
             self._ops_reduce_scatter = ops.reduce_scatter_gfx1250
             self._ops_dispose = ops.dispose_gfx1250
@@ -683,6 +685,7 @@ class CustomAllreduce:
             self._ops_meta_size = ops.meta_size
             self._ops_init_custom_ar = ops.init_custom_ar
             self._ops_all_reduce = ops.all_reduce
+            self._ops_all_reduce_dual = ops.all_reduce_dual
             self._ops_all_gather = None
             self._ops_reduce_scatter = ops.reduce_scatter
             self._ops_dispose = ops.dispose
@@ -696,7 +699,7 @@ class CustomAllreduce:
     def __init__(
         self,
         group: ProcessGroup,
-        device: Union[int, str, torch.device],
+        device: int | str | torch.device,
         max_size=1024 * 1024 * 1024,  # 2GB bf16/half
         enable_register_for_capturing: bool = True,
     ) -> None:
@@ -723,9 +726,9 @@ class CustomAllreduce:
 
         self.group = group
 
-        assert (
-            dist.get_backend(group) != dist.Backend.NCCL
-        ), "CustomAllreduce should be attached to a non-NCCL group."
+        assert dist.get_backend(group) != dist.Backend.NCCL, (
+            "CustomAllreduce should be attached to a non-NCCL group."
+        )
 
         if not all(in_the_same_node_as(group, source_rank=0)):
             # No need to initialize custom allreduce for multi-node case.
@@ -846,7 +849,7 @@ class CustomAllreduce:
         """gfx1250 VMM init: used when hipIpc is unusable (ROCm < 7.15). Shares
         GPU buffers across processes via the HIP VMM API (exported fd + Unix
         socket) instead of IPC handles."""
-        from .vmm_allocator import VMMBuffer, vmm_exchange, load_hip_runtime
+        from .vmm_allocator import VMMBuffer, load_hip_runtime, vmm_exchange
 
         meta_sz = self._ops_meta_size()
         # gfx1250 is 1-stage only — no tmp buffer after Signal needed
@@ -1060,6 +1063,32 @@ class CustomAllreduce:
             inp
         )
 
+    def should_custom_ar_dual(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+    ) -> bool:
+        """Return whether two registered inputs fit the one-stage dual kernel."""
+        if self.disabled or self._ops_all_reduce_dual is None:
+            return False
+        if left.numel() == 0 or right.numel() == 0:
+            return False
+        if left.device != right.device or left.dtype != right.dtype:
+            return False
+        if left.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            return False
+        if not is_weak_contiguous(left) or not is_weak_contiguous(right):
+            return False
+        left_bytes = left.numel() * left.element_size()
+        right_bytes = right.numel() * right.element_size()
+        if left_bytes % 16 != 0 or right_bytes % 16 != 0:
+            return False
+        total_bytes = left_bytes + right_bytes
+        if not self._car_min_size < total_bytes <= self._car_max_size:
+            return False
+        one_stage_limit = 160 * 1024 if self.world_size <= 4 else 80 * 1024
+        return self.fully_connected and total_bytes < one_stage_limit
+
     def should_custom_ar_bytes(self, inp: torch.Tensor, prefill_support: bool = False):
         """Return whether the tensor size fits custom AR even if it is strided.
 
@@ -1086,7 +1115,7 @@ class CustomAllreduce:
         self,
         inp: torch.Tensor,
         *,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
         use_new: bool = True,
         open_fp8_quant: bool = False,
         registered_input: bool = False,
@@ -1115,7 +1144,7 @@ class CustomAllreduce:
 
     def custom_all_reduce(
         self, input: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -1142,6 +1171,46 @@ class CustomAllreduce:
                 open_fp8_quant=open_fp8_quant,
                 registered_input=False,
             )
+
+    def all_reduce_dual(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        *,
+        left_out: torch.Tensor | None = None,
+        right_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce two separately registered inputs in one one-stage launch."""
+        if left_out is None:
+            left_out = torch.empty_like(left)
+        if right_out is None:
+            right_out = torch.empty_like(right)
+        if not is_weak_contiguous(left_out) or not is_weak_contiguous(right_out):
+            raise ValueError("dual-input custom allreduce outputs must be contiguous")
+        if self._ops_all_reduce_dual is None:
+            raise RuntimeError("dual-input custom allreduce is unavailable")
+        self._ops_all_reduce_dual(
+            self._ptr,
+            left,
+            right,
+            left_out,
+            right_out,
+        )
+        return left_out, right_out
+
+    def custom_all_reduce_dual(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Use the graph-registered dual kernel or return ``None`` for fallback."""
+        if not self.should_custom_ar_dual(left, right):
+            return None
+        if not self._IS_CAPTURING:
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            return self.all_reduce_dual(left, right)
+        return torch.zeros_like(left), torch.zeros_like(right)
 
     # reduce_scatter split_dim enum — must match `aiter::ReduceScatterSplitDim`
     # in csrc/include/custom_all_reduce.cuh.
@@ -1226,7 +1295,7 @@ class CustomAllreduce:
 
     def custom_reduce_scatter(
         self, input: torch.Tensor, output: torch.Tensor, dim: int = 0
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # when custom allreduce is disabled or this shape/dim is unsupported,
         # this will be None and the caller is expected to fall back to an
         # external reduce_scatter implementation (NCCL / pynccl / torch.dist).
@@ -1322,15 +1391,13 @@ class CustomAllreduce:
     # all-gather kernel is pure memcpy parametrized only by sizeof(T). View
     # ints as same-size floats so callers gathering token-id tensors work
     # (e.g. DeepSeek-V4-Pro hash-gate gathers int32 across DP ranks).
-    _INT_TO_FP_VIEW = {
+    _INT_TO_FP_VIEW: ClassVar[dict[str, Any]] = {
         torch.int64: torch.float64,
         torch.int32: torch.float32,
         torch.int16: torch.float16,
     }
 
-    def custom_all_gather(
-        self, inp: torch.Tensor, dim: int = 0
-    ) -> Optional[torch.Tensor]:
+    def custom_all_gather(self, inp: torch.Tensor, dim: int = 0) -> torch.Tensor | None:
         orig_dtype = inp.dtype
         view_dtype = self._INT_TO_FP_VIEW.get(orig_dtype) or orig_dtype
 
@@ -1360,9 +1427,9 @@ class CustomAllreduce:
         inp: torch.Tensor,
         res_inp: torch.Tensor,
         *,
-        res_out: Optional[torch.Tensor] = None,
-        out: Optional[torch.Tensor] = None,
-        scale_out: Optional[torch.Tensor] = None,
+        res_out: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+        scale_out: torch.Tensor | None = None,
         w: torch.Tensor,
         eps: float,
         registered: bool = False,
@@ -1460,7 +1527,7 @@ class CustomAllreduce:
         use_1stage: bool,
         out_hidden_dim: int = 0,
         gemma_norm: bool = False,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -1512,7 +1579,7 @@ class CustomAllreduce:
         out_hidden_dim: int = 0,
         prefill_support: bool = False,
         gemma_norm: bool = False,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # Let the C++ wrapper pack supported last-dim sliced views directly
         # into the registered IPC buffer so eager and graph paths both avoid
         # materializing an intermediate contiguous tensor in Python.

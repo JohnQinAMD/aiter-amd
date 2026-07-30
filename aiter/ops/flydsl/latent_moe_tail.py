@@ -130,7 +130,9 @@ def latent_moe_tail(
         or not out.is_contiguous()
         or tuple(out.shape) != (1, _HIDDEN_DIM)
     ):
-        raise ValueError("out must be contiguous BF16 shape (1, 7168) on the input device")
+        raise ValueError(
+            "out must be contiguous BF16 shape (1, 7168) on the input device"
+        )
     return _launch_b1_latent_moe_tail(
         routed,
         shared,

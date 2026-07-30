@@ -56,7 +56,11 @@ def build_b1_latent_moe_tail_module(
     if weight_cache_modifier not in (0, 1, 2, 3):
         raise ValueError("weight_cache_modifier must be between 0 and 3")
     block_threads = (
-        ((_LATENT_DIM + elements_per_thread - 1) // elements_per_thread + _WAVE_SIZE - 1)
+        (
+            (_LATENT_DIM + elements_per_thread - 1) // elements_per_thread
+            + _WAVE_SIZE
+            - 1
+        )
         // _WAVE_SIZE
         * _WAVE_SIZE
     )
@@ -96,7 +100,9 @@ def build_b1_latent_moe_tail_module(
         tid = ArithValue(gpu.thread_idx.x)
         lane = tid % arith.constant(_WAVE_SIZE, type=i32)
         wave = tid // arith.constant(_WAVE_SIZE, type=i32)
-        output_base = ArithValue(gpu.block_idx.x) * arith.constant(rows_per_block, type=i32)
+        output_base = ArithValue(gpu.block_idx.x) * arith.constant(
+            rows_per_block, type=i32
+        )
         k_base = tid * arith.constant(elements_per_thread, type=i32)
 
         routed_rsrc = ptr_rsrc(routed)
@@ -127,7 +133,9 @@ def build_b1_latent_moe_tail_module(
 
         def load_bf16x8_masked(resource, element_index):
             if const_expr(block_threads * elements_per_thread == _LATENT_DIM):
-                return load_bf16x8(resource, element_index // arith.constant(2, type=i32))
+                return load_bf16x8(
+                    resource, element_index // arith.constant(2, type=i32)
+                )
             valid = arith.cmpi(
                 CmpIPredicate.ult,
                 element_index,
@@ -135,7 +143,9 @@ def build_b1_latent_moe_tail_module(
             )
             load_if = scf.IfOp(valid, results_=[vec8_bf16], has_else=True)
             with ir.InsertionPoint(load_if.then_block):
-                loaded = load_bf16x8(resource, element_index // arith.constant(2, type=i32))
+                loaded = load_bf16x8(
+                    resource, element_index // arith.constant(2, type=i32)
+                )
                 scf.YieldOp([_raw(loaded)])
             with ir.InsertionPoint(load_if.else_block):
                 scf.YieldOp([_raw(zero_bf16_vec)])
@@ -219,7 +229,9 @@ def build_b1_latent_moe_tail_module(
                 scf.YieldOp([])
             gpu.barrier()
 
-            is_thread_zero = arith.cmpi(CmpIPredicate.eq, tid, arith.constant(0, type=i32))
+            is_thread_zero = arith.cmpi(
+                CmpIPredicate.eq, tid, arith.constant(0, type=i32)
+            )
             thread_zero_if = scf.IfOp(is_thread_zero)
             with ir.InsertionPoint(thread_zero_if.then_block):
                 total_square_sum = ArithValue(zero_f32)
@@ -259,7 +271,9 @@ def build_b1_latent_moe_tail_module(
             local_dot = ArithValue(zero_f32)
             for vector_index in range_constexpr(vectors_per_thread):
                 row_element = k_base + arith.constant(vector_index * 8, type=i32)
-                weight_element = safe_row * arith.constant(_LATENT_DIM, type=i32) + row_element
+                weight_element = (
+                    safe_row * arith.constant(_LATENT_DIM, type=i32) + row_element
+                )
                 if const_expr(block_threads * elements_per_thread == _LATENT_DIM):
                     weight_bf16 = load_bf16x8(
                         up_weight_rsrc,
@@ -319,7 +333,9 @@ def build_b1_latent_moe_tail_module(
         with ir.InsertionPoint(write_if.then_block):
             dot = ArithValue(zero_f32)
             for wave_index in range_constexpr(waves):
-                index = tid * arith.constant(waves, type=i32) + arith.constant(wave_index, type=i32)
+                index = tid * arith.constant(waves, type=i32) + arith.constant(
+                    wave_index, type=i32
+                )
                 dot = dot + _lds_load(dot_sums, index)
             projected_bf16 = arith.trunc_f(T.bf16, _raw(dot))
             projected_f32 = ArithValue(arith.extf(f32, projected_bf16))
@@ -344,7 +360,10 @@ def build_b1_latent_moe_tail_module(
         ctx = CompilationContext.get_current()
         if const_expr(waves_per_eu > 0):
             for operation in ctx.gpu_module_body.operations:
-                if hasattr(operation, "attributes") and operation.OPERATION_NAME == "gpu.func":
+                if (
+                    hasattr(operation, "attributes")
+                    and operation.OPERATION_NAME == "gpu.func"
+                ):
                     operation.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
                         T.i32, int(waves_per_eu)
                     )

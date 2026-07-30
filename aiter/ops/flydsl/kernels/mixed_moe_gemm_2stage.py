@@ -23,7 +23,6 @@ import functools
 import os
 from contextlib import contextmanager
 from enum import Enum
-from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -247,12 +246,12 @@ def compile_mixed_moe_gemm1(
         raise ValueError("mock_gate_only requires k_batch > 1 (split-K)")
     if is_splitk:
         k_per_batch = model_dim // k_batch
-        assert (
-            model_dim % k_batch == 0
-        ), f"model_dim={model_dim} not divisible by k_batch={k_batch}"
-        assert (
-            k_per_batch % tile_k == 0
-        ), f"K_per_batch={k_per_batch} not divisible by tile_k={tile_k}"
+        assert model_dim % k_batch == 0, (
+            f"model_dim={model_dim} not divisible by k_batch={k_batch}"
+        )
+        assert k_per_batch % tile_k == 0, (
+            f"K_per_batch={k_per_batch} not divisible by tile_k={tile_k}"
+        )
 
         out_dtype = "bf16"
     else:
@@ -441,7 +440,7 @@ def compile_mixed_moe_gemm1(
         pipe_phases.append(phase)
 
     bi = 0
-    for _p in range(1, pipe_n_phases):
+    for _p in range(pipe_n_phases):
         rem_b = len(pipe_b_loads) - bi
         rem_p = pipe_n_phases - _p
         n_b = (rem_b + rem_p - 1) // rem_p if rem_p > 0 else 0
@@ -1578,9 +1577,10 @@ def compile_mixed_moe_gemm1(
                     lds_read (already DMA'd in previous half).
 
                     Interleaving schedule (per half):
-                      Phase 0: scale VMEM + 2 ds_read(A) -> 4 MFMA(prev)
-                      Phase 1..N: B VMEM(distributed) + 2 ds_read(A, if avail) -> 4 MFMA(prev)
-                      Phase N+1..: remaining B VMEM -> 4 MFMA(prev)
+                      Phase 0: scale VMEM + early B VMEM + ds_read(A)
+                               -> MFMA(prev)
+                      Phase 1..N: remaining B VMEM + ds_read(A, if available)
+                                  -> MFMA(prev)
                     """
                     abs_k = k_base_idx + arith.constant(next_k_load, index=True)
                     bk = abs_k // arith.constant(b_byte_div, index=True)
@@ -2160,13 +2160,21 @@ def compile_mixed_moe_gemm1(
                         u = _clamp_lin(u)
                         return silu_elem(g) * u
 
-                kwave_fused = const_expr(
+                kwave_separated_fused = const_expr(
                     k_wave > 1
                     and not enable_bias
                     and not is_splitk
                     and not gate_up_interleave
                     and need_quant
                 )
+                kwave_gui_fused = const_expr(
+                    k_wave > 1
+                    and not enable_bias
+                    and not is_splitk
+                    and gate_up_interleave
+                    and need_quant
+                )
+                kwave_fused = const_expr(kwave_separated_fused or kwave_gui_fused)
 
                 if const_expr(k_wave > 1 and not kwave_fused):
                     has_up = const_expr(acc_up is not None)
@@ -2286,7 +2294,9 @@ def compile_mixed_moe_gemm1(
                                 )
                                 acc_up[aidx] = arith.addf(acc_up[aidx], bsplat)
 
-                if const_expr(gate_up_interleave and not is_splitk):
+                if const_expr(
+                    gate_up_interleave and not is_splitk and not kwave_gui_fused
+                ):
                     gui_out_n = num_acc_n // pack_N
                     acc = [None] * (gui_out_n * m_repeat)
                     for mi in range_constexpr(m_repeat):
@@ -2456,7 +2466,7 @@ def compile_mixed_moe_gemm1(
                 sk_n_offset = [0]
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                    fused, row_byte_base = row_ctx
+                    _fused, row_byte_base = row_ctx
                     if const_expr(need_quant and not is_splitk):
                         frag_vals = []
                         for i in range_constexpr(e_vec):
@@ -2680,7 +2690,7 @@ def compile_mixed_moe_gemm1(
                     else (ir.BF16Type.get() if out_is_bf16 else ir.F16Type.get())
                 )
 
-                if const_expr(kwave_fused):
+                if const_expr(kwave_separated_fused):
                     slab_n = tile_m * tile_n
                     slab_ty = _mT.memref(
                         k_wave * slab_n, f32, memory_space=_lds_space()
@@ -2808,6 +2818,170 @@ def compile_mixed_moe_gemm1(
                         ifr = scf.IfOp(rp)
                         with ir.InsertionPoint(ifr.then_block):
                             fused_read()
+                            scf.YieldOp([])
+                elif const_expr(kwave_gui_fused):
+                    # Interleaved gate/up uses 16-column chunks:
+                    # [gate0:16, up0:16, gate1:16, up1:16, ...]. Keep every
+                    # K-wave partial in one LDS slab, then combine K-wave and
+                    # gate/up ownership in the quantizing reader. This avoids
+                    # the generic K-wave reduction slab followed by a second
+                    # CShuffle write/read phase.
+                    slab_n = tile_m * tile_n
+                    slab_ty = _mT.memref(
+                        k_wave * slab_n,
+                        f32,
+                        memory_space=_lds_space(),
+                    )
+                    gui_slab = memref.view(
+                        slab_ty,
+                        base_ptr_pong,
+                        arith.constant(lds_pong_offset, index=True),
+                        sizes=[],
+                    )
+                    c_tn = arith.constant(tile_n, index=True)
+                    c_slabn = arith.constant(slab_n, index=True)
+                    kg_base = wave_k_id * c_slabn
+                    vec1_f32 = T.vec(1, f32)
+                    vecev_f32 = T.vec(e_vec, f32)
+
+                    gpu.barrier()
+
+                    def gui_fused_write(mi, ii, row_in_tile, row):
+                        rb = row_in_tile * c_tn
+                        for ni in range_constexpr(num_acc_n):
+                            col = (
+                                n_tile_base
+                                + lane_mod_16
+                                + arith.constant(ni * 16, index=True)
+                            )
+                            aidx = mi * num_acc_n + ni
+                            value = vector.extract(
+                                acc_gate[aidx],
+                                static_position=[ii],
+                                dynamic_position=[],
+                            )
+                            vector.store(
+                                vector.from_elements(vec1_f32, [value]),
+                                gui_slab,
+                                [kg_base + rb + col],
+                                alignment=4,
+                            )
+
+                    default_epilog(
+                        arith=arith,
+                        range_constexpr=range_constexpr,
+                        m_repeat=m_repeat,
+                        lane_div_16=lane_div_16,
+                        bx_m=bx_m,
+                        body_row=gui_fused_write,
+                    )
+                    gpu.barrier()
+
+                    gui_tile_n = tile_n // 2
+                    gui_cshuffle_nlane = min(32, gui_tile_n // e_vec)
+                    gui_by_n = by_n // arith.constant(2, index=True)
+                    cn = int(gui_cshuffle_nlane)
+                    gui_cshuffle_threads = min(
+                        int(total_threads),
+                        int(tile_m) * cn,
+                    )
+                    cm = gui_cshuffle_threads // cn
+                    mreps = int(tile_m) // cm
+                    nreps = int(gui_tile_n) // (cn * int(e_vec))
+                    c_cn = arith.constant(cn, index=True)
+                    c_ev = arith.constant(e_vec, index=True)
+                    c16_idx = arith.constant(16, index=True)
+                    c32_idx = arith.constant(32, index=True)
+                    gui_reader_active = arith.cmpi(
+                        CmpIPredicate.ult,
+                        tx,
+                        arith.constant(gui_cshuffle_threads, index=True),
+                    )
+                    m_lane = tx / c_cn
+                    n_lane = tx % c_cn
+                    for mr in range_constexpr(mreps):
+                        row_local = arith.constant(mr * cm, index=True) + m_lane
+                        row = bx_m + row_local
+                        row_context, row_valid = precompute_row(
+                            row_local=row_local,
+                            row=row,
+                        )
+                        row_valid = arith.andi(row_valid, gui_reader_active)
+
+                        def gui_fused_read(
+                            row_local=row_local,
+                            row=row,
+                            row_context=row_context,
+                        ):
+                            row_base = row_local * c_tn
+                            for nr in range_constexpr(nreps):
+                                output_col = (
+                                    arith.constant(
+                                        nr * (cn * int(e_vec)),
+                                        index=True,
+                                    )
+                                    + n_lane * c_ev
+                                )
+                                chunk = output_col / c16_idx
+                                within_chunk = output_col % c16_idx
+                                gate_col = chunk * c32_idx + within_chunk
+                                gate_sum = None
+                                up_sum = None
+                                for kg in range_constexpr(k_wave):
+                                    wave_base = (
+                                        arith.constant(kg, index=True) * c_slabn
+                                        + row_base
+                                    )
+                                    gate_values = vector.load_op(
+                                        vecev_f32,
+                                        gui_slab,
+                                        [wave_base + gate_col],
+                                    )
+                                    up_values = vector.load_op(
+                                        vecev_f32,
+                                        gui_slab,
+                                        [wave_base + gate_col + c16_idx],
+                                    )
+                                    if kg == 0:
+                                        gate_sum = gate_values
+                                        up_sum = up_values
+                                    else:
+                                        gate_sum = arith.addf(
+                                            gate_sum,
+                                            gate_values,
+                                        )
+                                        up_sum = arith.addf(
+                                            up_sum,
+                                            up_values,
+                                        )
+                                activated = []
+                                for element in range_constexpr(int(e_vec)):
+                                    gate_value = vector.extract(
+                                        gate_sum,
+                                        static_position=[element],
+                                        dynamic_position=[],
+                                    )
+                                    up_value = vector.extract(
+                                        up_sum,
+                                        static_position=[element],
+                                        dynamic_position=[],
+                                    )
+                                    activated.append(act_elem(gate_value, up_value))
+                                store_pair(
+                                    row_local=row_local,
+                                    row=row,
+                                    row_ctx=row_context,
+                                    col_pair0=output_col,
+                                    col_g0=gui_by_n + output_col,
+                                    frag=vector.from_elements(
+                                        vecev_f32,
+                                        activated,
+                                    ),
+                                )
+
+                        row_if = scf.IfOp(row_valid)
+                        with ir.InsertionPoint(row_if.then_block):
+                            gui_fused_read()
                             scf.YieldOp([])
                 elif const_expr(gate_up_interleave and not is_splitk):
                     gui_eff_n = gui_out_n
@@ -3074,7 +3248,7 @@ def compile_mixed_moe_gemm1(
     return launch_mixed_moe_gemm1
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def compile_mixed_moe_gemm2(
     *,
     model_dim: int,
@@ -3095,14 +3269,15 @@ def compile_mixed_moe_gemm2(
     inter_dim_pad: int = 0,
     persist_m: int = 4,
     sort_block_m: int = 0,
-    waves_per_eu: Optional[int] = None,
+    waves_per_eu: int | None = None,
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
     b_nt: int = 0,
     xcd_swizzle: int = 0,
 ):
     """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> [tokens, model_dim], atomic-add."""
-    del b_nt
+    if not isinstance(b_nt, int) or b_nt not in (0, 1, 2, 3):
+        raise ValueError(f"b_nt must be one of 0, 1, 2, 3, got {b_nt!r}")
     _sort_block_m = tile_m if sort_block_m <= 0 else sort_block_m
     if const_expr(_sort_block_m != tile_m and _sort_block_m % tile_m != 0):
         raise ValueError(
@@ -3802,6 +3977,7 @@ def compile_mixed_moe_gemm2(
                             vec_elems=vec_elems,
                             elem_bytes=b_elem_bytes,
                             offset_in_bytes=(b_elem_bytes == 1),
+                            cache_modifier=b_nt,
                         )
                         b_i64x2 = vector.bitcast(vec2_i64, b16)
                         return (
@@ -4178,14 +4354,14 @@ def compile_mixed_moe_gemm2(
                     if const_expr(xdl_arb_hint):
                         rocdl.disable_xdl_arb_stall()
 
-                    if const_expr(b_hi_loader is not None):
-                        b_hi = b_hi_loader()
-                        for bhi_i in range_constexpr(len(b_hi)):
-                            b_tile_full[b_split_ku + bhi_i] = b_hi[bhi_i]
-
                     rocdl.s_setprio(1)
 
                     for k_idx in range_constexpr(ku_loop):
+                        if const_expr(b_hi_loader is not None and k_idx == b_split_ku):
+                            b_hi = b_hi_loader()
+                            for bhi_i in range_constexpr(len(b_hi)):
+                                b_tile_full[b_split_ku + bhi_i] = b_hi[bhi_i]
+
                         ku128 = k_idx >> pack_K_shift
                         ikxdl = k_idx & pack_K_mask
 
@@ -4768,7 +4944,7 @@ def compile_mixed_moe_gemm2(
                     return llvm.inttoptr(ptr_ty, i64_raw)
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                    fused, row_byte_base, row_byte_off_i32 = row_ctx
+                    _fused, row_byte_base, row_byte_off_i32 = row_ctx
                     if const_expr(not bool(accumulate)):
                         col_idx = col_g0
                         byte_off_col = col_idx * arith.constant(
@@ -5124,12 +5300,12 @@ def compile_mixed_moe_gemm1_a16w4(
     else:
         if _is_splitk:
             _k_per_batch = model_dim // k_batch
-            assert (
-                model_dim % k_batch == 0
-            ), f"model_dim={model_dim} not divisible by k_batch={k_batch}"
-            assert (
-                _k_per_batch % tile_k == 0
-            ), f"K_per_batch={_k_per_batch} not divisible by tile_k={tile_k}"
+            assert model_dim % k_batch == 0, (
+                f"model_dim={model_dim} not divisible by k_batch={k_batch}"
+            )
+            assert _k_per_batch % tile_k == 0, (
+                f"K_per_batch={_k_per_batch} not divisible by tile_k={tile_k}"
+            )
             out_dtype = "bf16"
         else:
             _k_per_batch = model_dim
@@ -5508,10 +5684,7 @@ def compile_mixed_moe_gemm1_a16w4(
             by = gpu.block_id("x")
             bx = gpu.block_id("y")
 
-            # Route metadata remains in the standard 32-row expert buckets
-            # even when the B1 direct path issues a native 16-row MFMA tile.
-            # Advance by the producer's bucket stride, not the compute tile.
-            bx_m = bx * arith.index(sort_block_m)
+            bx_m = bx * arith.index(tile_m)
             numids_rsrc = ptr_buffer_resource(
                 arg_num_valid_ids, arith.constant(4, type=i32)
             )
