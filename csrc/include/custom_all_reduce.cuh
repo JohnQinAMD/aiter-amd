@@ -400,7 +400,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
     __shared__ P tmp_smem[2][tnum_gpu * ngpus];
 
     const int step  = gridDim.x * tnum_gpu;
-    const int start = blockIdx.x * tnum_gpu + lane_id;
+    const int start     = blockIdx.x * tnum_gpu + lane_id;
 
     start_sync<ngpus>(sg, self_sg, rank);
 
@@ -476,6 +476,116 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
         __syncthreads();
 
         buf = next_buf;
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_1stage_dual(RankData* _left_staging_dp,
+                                    RankData* _right_dp,
+                                    RankSignals sg,
+#ifndef USE_ROCM
+                                    volatile
+#endif
+                                    Signal* self_sg,
+                                    const T* __restrict__ left,
+                                    T* __restrict__ left_staging,
+                                    T* __restrict__ left_result,
+                                    T* __restrict__ right_result,
+                                    int rank,
+                                    int left_size,
+                                    int right_size)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    constexpr int tnum_gpu  = THREAD_NUM / ngpus;
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+
+    auto left_dp        = *_left_staging_dp;
+    auto right_dp       = *_right_dp;
+    int warp_id         = threadIdx.x / tnum_gpu;
+    int lane_id         = threadIdx.x % tnum_gpu;
+    const int size      = left_size + right_size;
+    const int step      = gridDim.x * tnum_gpu;
+    const int start = blockIdx.x * tnum_gpu + lane_id;
+    __shared__ P tmp_smem[2][tnum_gpu * ngpus];
+
+    // Stage the smaller local input into the existing pre-registered pool.
+    // Each block copies exactly the logical packs it will later reduce. The
+    // release/acquire system barrier makes those stores visible to the
+    // corresponding block on every peer before any peer load.
+    if(threadIdx.x < tnum_gpu)
+    {
+        const P* left_packs = reinterpret_cast<const P*>(left);
+        P* staging_packs    = reinterpret_cast<P*>(left_staging);
+        for(int copy_idx = start; copy_idx < left_size; copy_idx += step)
+            staging_packs[copy_idx] = left_packs[copy_idx];
+    }
+    end_sync<ngpus>(sg, self_sg, rank);
+
+    const int first = blockIdx.x * tnum_gpu;
+    int iters       = 0;
+    {
+        int remaining = size - first;
+        iters = remaining > 0 ? (remaining + step - 1) / step : 0;
+    }
+
+    int buffer = 0;
+    int idx0   = start;
+    if(idx0 < size)
+    {
+        const bool use_left = idx0 < left_size;
+        const int input_idx = use_left ? idx0 : idx0 - left_size;
+        const P* input      = reinterpret_cast<const P*>(
+            use_left ? left_dp.ptrs[warp_id] : right_dp.ptrs[warp_id]);
+        tmp_smem[buffer][warp_id * tnum_gpu + lane_id] = input[input_idx];
+    }
+    __syncthreads();
+
+    for(int iteration = 0; iteration < iters; ++iteration)
+    {
+        const int current_idx = idx0 + iteration * step;
+        const int next_idx    = current_idx + step;
+        const int next_buffer = buffer ^ 1;
+
+        if(warp_id == 0 && current_idx < size)
+        {
+            P first_value = tmp_smem[buffer][lane_id];
+            A accumulator;
+#pragma unroll
+            for(int element = 0; element < pack_size; ++element)
+                accumulator[element] = upcast_s(first_value[element]);
+#pragma unroll
+            for(int gpu = 1; gpu < ngpus; ++gpu)
+            {
+                P value = tmp_smem[buffer][gpu * tnum_gpu + lane_id];
+#pragma unroll
+                for(int element = 0; element < pack_size; ++element)
+                    accumulator[element] += upcast_s(value[element]);
+            }
+
+            P output;
+#pragma unroll
+            for(int element = 0; element < pack_size; ++element)
+                output[element] = downcast_s<T>(accumulator[element]);
+
+            if(current_idx < left_size)
+                reinterpret_cast<P*>(left_result)[current_idx] = output;
+            else
+                reinterpret_cast<P*>(right_result)[current_idx - left_size] = output;
+        }
+
+        if(next_idx < size)
+        {
+            const bool use_left = next_idx < left_size;
+            const int input_idx = use_left ? next_idx : next_idx - left_size;
+            const P* input      = reinterpret_cast<const P*>(
+                use_left ? left_dp.ptrs[warp_id] : right_dp.ptrs[warp_id]);
+            tmp_smem[next_buffer][warp_id * tnum_gpu + lane_id] = input[input_idx];
+        }
+        __syncthreads();
+        buffer = next_buffer;
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
@@ -3346,6 +3456,7 @@ class CustomAllreduce
     RankSignals sg_;
     std::unordered_map<void*, RankData*> input_buffer;
     std::unordered_map<void*, RankData*> output_buffers_;
+    void* registered_input_buffer_ = nullptr;
     Signal* self_sg_;
 
     // stores the registered device pointers from all ranks
@@ -3491,6 +3602,7 @@ class CustomAllreduce
         auto d_data = d_rank_data_base_++;
         HIP_CALL(hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));
         input_buffer[self] = d_data;
+        registered_input_buffer_ = self;
     }
 
     void register_output_buffer(const hipIpcMemHandle_t* ipc_handles,
@@ -3894,6 +4006,79 @@ class CustomAllreduce
     }
 #undef REDUCE_CASE
 #undef KL
+}
+
+template <typename T>
+void allreduceDual(hipStream_t stream,
+                   T* left,
+                   T* right,
+                   T* left_output,
+                   T* right_output,
+                   int left_size,
+                   int right_size)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    if(left_size <= 0 || right_size <= 0)
+        throw std::runtime_error("dual-input custom allreduce requires non-empty inputs");
+    if(left_size % pack_size != 0 || right_size % pack_size != 0)
+        throw std::runtime_error(
+            "dual-input custom allreduce requires each input byte size to be a multiple of 16");
+    if(!full_nvlink_)
+        throw std::runtime_error(
+            "dual-input custom allreduce requires fully connected peer GPUs");
+
+    const int left_packs  = left_size / pack_size;
+    const int right_packs = right_size / pack_size;
+    const int total_bytes = (left_size + right_size) * sizeof(T);
+    const int one_stage_limit =
+        world_size_ <= 4 ? 160 * 1024 : (world_size_ <= 8 ? 80 * 1024 : 0);
+    if(total_bytes >= one_stage_limit)
+        throw std::runtime_error(
+            "dual-input custom allreduce currently supports only the one-stage size range");
+
+    if(registered_input_buffer_ == nullptr)
+        throw std::runtime_error(
+            "dual-input custom allreduce requires a registered staging buffer");
+    auto staging_it = input_buffer.find(registered_input_buffer_);
+    if(staging_it == input_buffer.end())
+        throw std::runtime_error(
+            "dual-input custom allreduce staging metadata is unavailable");
+    RankData* left_staging_ptrs = staging_it->second;
+    RankData* right_ptrs        = get_buffer_RD(stream, right);
+    T* left_staging           = reinterpret_cast<T*>(registered_input_buffer_);
+    constexpr int threads     = 512;
+    const int total_packs     = left_packs + right_packs;
+    const int threads_per_gpu = threads / world_size_;
+    const int blocks          = std::min(
+        kMaxBlocks, (total_packs + threads_per_gpu - 1) / threads_per_gpu);
+
+#define DUAL_REDUCE_CASE(ngpus)                                          \
+    case ngpus:                                                          \
+        cross_device_reduce_1stage_dual<T, ngpus>                        \
+            <<<blocks, threads, 0, stream>>>(left_staging_ptrs,          \
+                                             right_ptrs,                 \
+                                             sg_,                        \
+                                             self_sg_,                   \
+                                             left,                       \
+                                             left_staging,               \
+                                             left_output,                \
+                                             right_output,               \
+                                             rank_,                      \
+                                             left_packs,                 \
+                                             right_packs);               \
+        break
+
+    switch(world_size_)
+    {
+        DUAL_REDUCE_CASE(2);
+        DUAL_REDUCE_CASE(4);
+        DUAL_REDUCE_CASE(6);
+        DUAL_REDUCE_CASE(8);
+    default:
+        throw std::runtime_error(
+            "dual-input custom allreduce supports world sizes 2, 4, 6, and 8");
+    }
+#undef DUAL_REDUCE_CASE
 }
 
 // reduce_scatter dispatch. Python wrapper is responsible for:
