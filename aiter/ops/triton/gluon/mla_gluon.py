@@ -433,11 +433,17 @@ def _mla_gluon(
     # global load K_nope slice 0
     offs_n_nope0 = split_kv_start + gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, blocked_kv_slice))
     offs_d_ckv_10 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv_slice))
-    offs_k_c0 = kv_loc0[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
     bufs_kv0 = bufs_kv.index(0).slice(0, BLOCK_N // 2, 1)
     if WITHIN_2GB:
+        offs_k_c0 = kv_loc0[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv0, Kv_c_cache, offs_k_c0, mask=offs_n_nope0[None, :] < split_kv_end)
     else:
+        # `row * stride` is evaluated in int32; once the block id passes
+        # 2**31 // stride rows the product wraps NEGATIVE and addresses
+        # GiBs below the cache base -> memory access fault. Widen the 1-D
+        # row index (the 2-D offset stays affine, so async-copy still
+        # legalizes). buffer_load needs int32, so only this branch.
+        offs_k_c0 = kv_loc0.to(gl.int64)[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
         gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv0, Kv_c_cache + offs_k_c0)
     gl.amd.cdna4.async_copy.commit_group()
 
@@ -445,10 +451,16 @@ def _mla_gluon(
     if HAS_PE:
         offs_n_pe0 = split_kv_start + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
         offs_d_kpe_1 = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
-        offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
         if WITHIN_2GB:
+            offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
             gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(0), K_pe_cache, offs_k_pe, mask=offs_n_pe0[None, :] < split_kv_end)
         else:
+            # `row * stride` is evaluated in int32; once the block id passes
+            # 2**31 // stride rows the product wraps NEGATIVE and addresses
+            # GiBs below the cache base -> memory access fault. Widen the 1-D
+            # row index (the 2-D offset stays affine, so async-copy still
+            # legalizes). buffer_load needs int32, so only this branch.
+            offs_k_pe = kv_loc_pe.to(gl.int64)[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
             gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(0), K_pe_cache + offs_k_pe)
         gl.amd.cdna4.async_copy.commit_group()
 
@@ -460,10 +472,16 @@ def _mla_gluon(
     # global load K_nope slice 1
     offs_n_nope1 = offs_n_nope0 + BLOCK_N // 2
     bufs_kv1 = bufs_kv.index(0).slice(BLOCK_N // 2, BLOCK_N // 2, 1)
-    offs_k_c1 = kv_loc1[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
     if WITHIN_2GB:
+        offs_k_c1 = kv_loc1[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv1, Kv_c_cache, offs_k_c1, mask=offs_n_nope1[None, :] < split_kv_end)
     else:
+        # `row * stride` is evaluated in int32; once the block id passes
+        # 2**31 // stride rows the product wraps NEGATIVE and addresses
+        # GiBs below the cache base -> memory access fault. Widen the 1-D
+        # row index (the 2-D offset stays affine, so async-copy still
+        # legalizes). buffer_load needs int32, so only this branch.
+        offs_k_c1 = kv_loc1.to(gl.int64)[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
         gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv1, Kv_c_cache + offs_k_c1)
     gl.amd.cdna4.async_copy.commit_group()
 
@@ -493,10 +511,16 @@ def _mla_gluon(
         # global load K_nope slice 0
         offs_n_nope0 = start_n + gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, blocked_kv_slice))
         offs_d_ckv_10 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv_slice))
-        offs_k_c0 = kv_loc0[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
         if WITHIN_2GB:
+            offs_k_c0 = kv_loc0[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
             gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv0, Kv_c_cache, offs_k_c0, mask=offs_n_nope0[None, :] < split_kv_end)
         else:
+            # `row * stride` is evaluated in int32; once the block id passes
+            # 2**31 // stride rows the product wraps NEGATIVE and addresses
+            # GiBs below the cache base -> memory access fault. Widen the 1-D
+            # row index (the 2-D offset stays affine, so async-copy still
+            # legalizes). buffer_load needs int32, so only this branch.
+            offs_k_c0 = kv_loc0.to(gl.int64)[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
             # No mask needed on global_load path in the loop body: all
             # iterations are guaranteed in-bounds by num_iter arithmetic.
             # Only the epilogue uses mask + other=0 for the last
@@ -511,10 +535,16 @@ def _mla_gluon(
             # global load K_pe
             offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
             offs_d_kpe_1 = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
-            offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
             if WITHIN_2GB:
+                offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
                 gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache, offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end)
             else:
+                # `row * stride` is evaluated in int32; once the block id passes
+                # 2**31 // stride rows the product wraps NEGATIVE and addresses
+                # GiBs below the cache base -> memory access fault. Widen the 1-D
+                # row index (the 2-D offset stays affine, so async-copy still
+                # legalizes). buffer_load needs int32, so only this branch.
+                offs_k_pe = kv_loc_pe.to(gl.int64)[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
                 # No mask needed: loop iterations are in-bounds (see KV slice 0 comment).
                 gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache + offs_k_pe)
             gl.amd.cdna4.async_copy.commit_group()
@@ -533,10 +563,16 @@ def _mla_gluon(
         kv_loc1 = kv_page_number_1
         # global load K_nope slice 1
         offs_n1 = offs_n_nope0 + BLOCK_N // 2
-        offs_k_c1 = kv_loc1[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
         if WITHIN_2GB:
+            offs_k_c1 = kv_loc1[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
             gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv1, Kv_c_cache, offs_k_c1, mask=offs_n1[None, :] < split_kv_end)
         else:
+            # `row * stride` is evaluated in int32; once the block id passes
+            # 2**31 // stride rows the product wraps NEGATIVE and addresses
+            # GiBs below the cache base -> memory access fault. Widen the 1-D
+            # row index (the 2-D offset stays affine, so async-copy still
+            # legalizes). buffer_load needs int32, so only this branch.
+            offs_k_c1 = kv_loc1.to(gl.int64)[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
             # No mask needed: loop iterations are in-bounds (see KV slice 0 comment).
             gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv1, Kv_c_cache + offs_k_c1)
         gl.amd.cdna4.async_copy.commit_group()
@@ -583,10 +619,16 @@ def _mla_gluon(
         # global load K_nope
         offs_n_nope = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kv))
         offs_d_ckv_1 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv))
-        offs_k_c = kv_loc[None, :] * stride_kv_c_bs + offs_d_ckv_1[:, None]
         if WITHIN_2GB:
+            offs_k_c = kv_loc[None, :] * stride_kv_c_bs + offs_d_ckv_1[:, None]
             gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv.index(async_idx), Kv_c_cache, offs_k_c, mask=offs_n_nope[None, :] < split_kv_end)
         else:
+            # `row * stride` is evaluated in int32; once the block id passes
+            # 2**31 // stride rows the product wraps NEGATIVE and addresses
+            # GiBs below the cache base -> memory access fault. Widen the 1-D
+            # row index (the 2-D offset stays affine, so async-copy still
+            # legalizes). buffer_load needs int32, so only this branch.
+            offs_k_c = kv_loc.to(gl.int64)[None, :] * stride_kv_c_bs + offs_d_ckv_1[:, None]
             # No mask needed: out-of-range positions are discarded by the qk score mask
             gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv.index(async_idx), Kv_c_cache + offs_k_c)
         gl.amd.cdna4.async_copy.commit_group()
@@ -594,10 +636,16 @@ def _mla_gluon(
         if HAS_PE:
             offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
             offs_d_kpe_1 = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
-            offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
             if WITHIN_2GB:
+                offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
                 gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache, offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end)
             else:
+                # `row * stride` is evaluated in int32; once the block id passes
+                # 2**31 // stride rows the product wraps NEGATIVE and addresses
+                # GiBs below the cache base -> memory access fault. Widen the 1-D
+                # row index (the 2-D offset stays affine, so async-copy still
+                # legalizes). buffer_load needs int32, so only this branch.
+                offs_k_pe = kv_loc_pe.to(gl.int64)[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
                 gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache + offs_k_pe)
             gl.amd.cdna4.async_copy.commit_group()
 
