@@ -642,6 +642,8 @@ class _GFX1250BufferProxy:
 
 
 class CustomAllreduce:
+    supports_custom_all_reduce_out = True
+
     _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 6, 8]
 
     def _select_ops(self):
@@ -1128,7 +1130,7 @@ class CustomAllreduce:
         """
         if out is None:
             out = torch.empty_like(inp)
-        assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+        self._validate_all_reduce_output(inp, out)
         reg_inp = 0 if registered_input else self._pool["input"].data_ptr
         reg_inp_bytes = 0 if registered_input else self._pool["input"].max_size
         self._ops_all_reduce(
@@ -1142,16 +1144,44 @@ class CustomAllreduce:
         )
         return out
 
+    @staticmethod
+    def _validate_all_reduce_output(
+        inp: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        if out.shape != inp.shape or out.dtype != inp.dtype or out.device != inp.device:
+            raise ValueError(
+                "custom allreduce output must match the input's shape, "
+                "dtype, and device"
+            )
+        if out.data_ptr() == inp.data_ptr():
+            raise ValueError("custom allreduce output must not alias its input")
+        assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+
     def custom_all_reduce(
-        self, input: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
+        self,
+        input: torch.Tensor,
+        use_new: bool = True,
+        open_fp8_quant: bool = False,
+        *,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
+        """Run custom all-reduce, optionally into a caller-owned output.
+
+        Supplying ``out`` preserves its address across graph capture and lets
+        a producer hand the reduced value directly to its consumer. Unsupported
+        inputs still return ``None`` without modifying ``out``.
+        """
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
+        if out is not None:
+            self._validate_all_reduce_output(input, out)
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.all_reduce(
                     input,
+                    out=out,
                     use_new=use_new,
                     open_fp8_quant=open_fp8_quant,
                     registered_input=self.enable_register_for_capturing,
@@ -1159,7 +1189,7 @@ class CustomAllreduce:
             else:
                 # if warm up, mimic the allocation pattern
                 # since custom allreduce is out-of-place
-                return torch.zeros_like(input)
+                return torch.zeros_like(input) if out is None else out.zero_()
         else:
             # note: outside of cuda graph context,
             # custom allreduce incurs a cost of cudaMemcpy, which should
@@ -1167,6 +1197,7 @@ class CustomAllreduce:
             # gains of using custom kernels
             return self.all_reduce(
                 input,
+                out=out,
                 use_new=use_new,
                 open_fp8_quant=open_fp8_quant,
                 registered_input=False,
