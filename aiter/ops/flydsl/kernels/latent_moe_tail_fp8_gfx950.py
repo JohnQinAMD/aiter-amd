@@ -332,7 +332,7 @@ def build_b1_latent_moe_tail_fp8_persistent_module(
         up_scale: fx.Pointer,
         output: fx.Pointer,
         epsilon: fx.Float32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         context = CompilationContext.get_current()
         if const_expr(waves_per_eu > 0):

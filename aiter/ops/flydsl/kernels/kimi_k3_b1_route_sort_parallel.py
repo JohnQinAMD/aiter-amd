@@ -13,12 +13,12 @@ from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     ptr_rsrc,
 )
-from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
 from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
 _ROUTE_THREADS = 64
@@ -690,7 +690,7 @@ def build_kimi_k3_b1_route_sort_parallel_module():
         hidden_states: fx.Pointer,
         quantized_hidden_states: fx.Pointer,
         quantized_scales: fx.Pointer,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
