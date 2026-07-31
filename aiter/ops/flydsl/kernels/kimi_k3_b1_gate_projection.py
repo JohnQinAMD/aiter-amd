@@ -107,7 +107,7 @@ def build_kimi_k3_b1_gate_projection_module():
         hidden: fx.Pointer,
         router_weight: fx.Pointer,
         logits: fx.Pointer,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
