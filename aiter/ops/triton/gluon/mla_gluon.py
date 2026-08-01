@@ -950,9 +950,12 @@ def mla_gluon(
         # splits for short sequences; stage 1 skips them and stage 2 derives the
         # valid split range from the runtime sequence length.
         if REGIME == "bh16bn128":
-            assert (
-                batch_size == 1
-            ), f"mla_gluon[bh16bn128] requires batch_size=1, got {batch_size}"
+            # Both bh16 regimes share the 2-D (batch, split) grid and take
+            # cur_batch from program_id(0); BLOCK_N and the K layout are the only
+            # differences, and neither is batch-dependent. The batch_size == 1
+            # assert that used to sit here guarded an untested path rather than a
+            # kernel limit, and it made fp8 KV mutually exclusive with speculative
+            # decoding, whose verify batches are always > 1.
             auto_num_kv_splits = max(
                 1, min(_MAX_NUM_KV_SPLITS // batch_size, min_kv_seq_len)
             )
