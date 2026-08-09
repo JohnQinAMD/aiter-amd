@@ -161,13 +161,14 @@ python op_tests/op_benchmarks/triton/bench_gemm_a8w8_blockscale.py [-gluon]
 
 **Description:** Multi-head Latent Attention (DeepSeek MLA) kernel with split-KV. For MLA Decode, Q is split into compressed latent (`q_nope`, dim=kv_lora_rank) and rope positional encoding (`q_pe`, dim=qk_rope_head_dim). KV cache is a flat `[N, 576]` buffer (`kv_c`). For DSv4 Sparse Prefill, Q packs compressed latent and positional encoding into one contiguous row (448 NoPE + 64 RoPE, `q_nope` with shape `[nquery, nhead, 512]`), KV cache has aligned `head_dim=512`, `q_pe` and `k_pe` can be left as placeholders. Uses 3-stage async copy pipeline with double-buffered page numbers and KV tiles.
 
-The wrapper dispatches by `(nhead, kv_c.dtype)` to one of three compile-time regimes (single `@gluon.jit` kernel, REGIME constexpr gates layouts and grid mapping):
+The wrapper dispatches by `(nhead, qlen, kv_c.dtype)` to one of four compile-time regimes (single `@gluon.jit` kernel, REGIME constexpr gates layouts and grid mapping). Integrations can feature-detect FP8 serving support through `MLA_GLUON_CAPABILITIES` instead of depending on internal regime names or an AITER version:
 
 - **`bh64`** (`nhead in {64, 128}`): bf16 KV, BLOCK_H=64, BLOCK_N=64, multi-batch + XCD-aware 3-D grid. `NUM_KV_SPLITS` auto-picked &isin; {1, 2, 4} so the launch fills ~256 workgroups (one wave on MI350). When `NUM_KV_SPLITS == 1`, stage-1 writes the final attention output directly to `o` (no temp buffer, no reduce). When `NUM_KV_SPLITS > 1`, stage-1 writes per-split `(acc, fp32 lse)` and stage-2 (`_mla_softmax_reducev_kernel`) reduces them into `o`.
-- **`bh16bn128`** (`nhead &le; 16`, `batch_size == 1`, fp8 KV): BLOCK_H=16, BLOCK_N=128, 2-D grid `(1, NUM_KV_SPLITS)` with token-bound `NUM_KV_SPLITS = max(1, min(256, min_kv_seq_len))` — 256 for the normal long-context path, reduced only for small kv (`min_kv_seq_len < 256`) so every split stays non-empty. Optional `kv_scale` dequant. Stage-2 reduce runs whenever `NUM_KV_SPLITS > 1` (skipped via the fast path only at `min_kv_seq_len == 1`). Supports the general case `num_iter &isin; {1, 2, ...}` (no `gl.assume(num_iter >= 3)`). `NHEAD < BLOCK_H` masks OOB heads on Q load and O store (wasted MFMA lanes are free; this regime is memory-bound).
+- **`bh16bn128`** (`nhead &le; 96`, `batch_size &ge; 1`, fp8 KV): BLOCK_H=16, BLOCK_N=128, with head blocks and query positions tiled on the grid. Optional `kv_scale` dequantization is applied to both QK and PV. Stage-2 reduce runs whenever `NUM_KV_SPLITS > 1`. Supports the general case `num_iter &isin; {1, 2, ...}` (no `gl.assume(num_iter >= 3)`). Partial head blocks mask OOB heads on Q load and O store.
+- **`bq64bn128fp8`** (`nhead &le; 16`, `2 &le; qlen &le; 4`, `batch_size &ge; 8`, fp8 KV): fuses up to 64 `(query position, head)` rows into one tile so MTP queries share each KV load. The PV path consumes fp8 values natively and applies the real `kv_scale` after accumulation.
 - **`bh16bn64`** (`nhead &le; 16`, bf16 KV): BLOCK_H=16, BLOCK_N=64, 2-D grid `(batch_size, NUM_KV_SPLITS)` with block-bound `NUM_KV_SPLITS = max(1, min(256 // batch_size, cdiv(min_kv_seq_len, BLOCK_N)))` — fills ~256 WGs but never splits a sequence into more than its 64-token block count, so small kv is supported and it collapses to 1 (one WG per batch over the whole sequence) when `min_kv_seq_len <= 64`. Use when KV is kept in bf16 (no fp8 quant). Same `NHEAD < BLOCK_H` masking. Full decode (stage-1, plus stage-2 reduce into `o` when `NUM_KV_SPLITS > 1`).
 
-All three regimes run the full decode and dsv4 prefill. `return_lse=True` also returns the merged fp32 lse `[batch, nhead]`, so `mla_gluon(...)` returns `(o, final_lse)` instead of `(o, None)`.
+All regimes run the full decode; the shared kernel also implements dsv4 prefill. `return_lse=True` returns merged fp32 lse `[batch, qlen, nhead]` for MTP and `[batch, nhead]` for plain decode, so `mla_gluon(...)` returns `(o, final_lse)` instead of `(o, None)`.
 
 Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py).
 
@@ -177,8 +178,8 @@ Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/bench
 | Q dtype | bf16 | bf16 | bf16 |
 | KV dtype | bf16 | fp8 | bf16 |
 | Output | bf16 | bf16 | bf16 |
-| batch_size | 64, 128, or 256 | 1 | &ge; 1 |
-| nhead | 64 or 128 | &le; 16 (tested: 4, 8, 16) | &le; 16 (tested: 4, 8, 16) |
+| batch_size | 64, 128, or 256 | &ge; 1 | &ge; 1 |
+| nhead | 64 or 128 | &le; 96 (tested serving path: 4, 8, 12, 16) | &le; 96 (tested: 4, 8, 16) |
 | Page size | 1 | 1 | 1 |
 | BLOCK_H | 64 | 16 | 16 |
 | BLOCK_N | 64 | 128 | 64 |

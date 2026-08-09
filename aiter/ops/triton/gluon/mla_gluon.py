@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # Gluon MLA decode kernel originated from FlashMLA triton kernel(https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py).
-# Stage-1 split-KV MLA attention using explicit Gluon layouts. Three regimes:
+# Stage-1 split-KV MLA attention using explicit Gluon layouts. Four regimes:
 #
 #   REGIME='bh64'      - bf16 Q + bf16 KV, BLOCK_H=64, BLOCK_N=64,
 #                        nhead in {64, 128}, batch_size in {64, 128, 256},
@@ -10,15 +10,18 @@
 #                        Fast path: when NUM_KV_SPLITS==1, stage-1 writes the
 #                        final output directly to O and stage-2 reduce is skipped.
 #   REGIME='bh16bn128' - bf16 Q + fp8 KV, BLOCK_H=16, BLOCK_N=128,
-#                        nhead <= 96, batch_size=1, NUM_KV_SPLITS=256.
-#                        (batch, split, head_block*qlen) grid. Always splits +
-#                        always reduces. A partial last head block
-#                        (nhead % BLOCK_H != 0) masks OOB heads on Q load / O store.
+#                        nhead <= 96, batch_size >= 1,
+#                        (batch, split, head_block*qlen) grid. Full decode
+#                        (stage-1 + stage-2 reduce into the final O). A partial
+#                        last head block (nhead % BLOCK_H != 0) masks OOB heads.
 #   REGIME='bh16bn64'  - bf16 Q + bf16 KV, BLOCK_H=16, BLOCK_N=64,
 #                        nhead <= 96, batch_size >= 1,
 #                        (batch, split, head_block*qlen) grid. Full decode
 #                        (stage-1 + stage-2 reduce into the final O). A partial
 #                        last head block (nhead % BLOCK_H != 0) masks OOB heads.
+#   REGIME='bq64bn128fp8' - Kimi-K3 MTP bf16 Q + fp8 KV. Flattens up to 64
+#                        (q_pos, head) rows into one BLOCK_H=64 tile so every
+#                        BLOCK_N=128 KV tile is loaded once for all q positions.
 #
 # The bh16 regimes support num_iter in {1, 2, ...} (no gl.assume(num_iter>=3));
 # only bh64 assumes >= 3. See epilogue-1 handling below.
@@ -43,10 +46,7 @@
 #     LLP, ACK                           -- local_load pages [i+1], async_copy K/KPE [i+1]
 #     LLK, MFMA0, softmax, LLV, MFMA1   -- compute on [i]: QK dot, softmax, PV dot
 
-# isort and black disagree here: isort wants two blank lines after this block,
-# black folds them back to one because the `# fmt: off` below starts a
-# formatting-disabled region. black is the one CI enforces, so it wins.
-import torch  # noqa: I001
+import torch
 import triton
 import triton.language as tl
 from triton.experimental import gluon
@@ -54,6 +54,15 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_xcds
+
+# Feature contract for backend selection.
+MLA_GLUON_CAPABILITIES = frozenset(
+    {
+        "fp8_kv_batched_decode",
+        "fp8_kv_mtp_decode",
+        "fp8_kv_scale",
+    }
+)
 
 # fmt: off
 @gluon.jit
@@ -99,9 +108,12 @@ def _mla_gluon(
     KV_PE_OFFSET: gl.constexpr,
     USE_2D_VIEW: gl.constexpr,
     WITHIN_2GB: gl.constexpr,
+    WIDE_KV_OFFSETS: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     NHEAD: gl.constexpr,
     REGIME: gl.constexpr,
+    DYNAMIC_KV_SPLITS: gl.constexpr,
+    BLOCK_BALANCED_SPLITS: gl.constexpr,
     RETURN_LSE: gl.constexpr,
     QLEN: gl.constexpr,  # MTP query length; 1 for plain decode
     # --- dsv4-prefill knobs ---
@@ -119,6 +131,13 @@ def _mla_gluon(
         cur_head_id = gl.program_id(1) % NUM_M_BLOCKS
         q_pos = gl.program_id(1) // NUM_M_BLOCKS
         split_kv_id = gl.program_id(2) % NUM_KV_SPLITS
+    elif REGIME == 'bq64bn128fp8':
+        # Kimi-K3 MTP decode: fold all (q_pos, head) rows into one 64-row
+        # MFMA tile.  The program reads its KV split once for every QLEN row.
+        cur_batch = gl.program_id(0)
+        split_kv_id = gl.program_id(1)
+        cur_head_id = 0
+        q_pos = 0
     else:
         # bh16*: grid axis 2 carries (head_block, q_pos). For nhead <= 16 there is
         # a single head block (NUM_M_BLOCKS==1) so cur_head_id==0 and q_pos==pid(2),
@@ -156,18 +175,41 @@ def _mla_gluon(
     # additionally bounds min_kv_seq_len so num_iter >= 3 for its gl.assume.
     # Trade-off: at seqs just above the wrapper minimum the last CU does up to
     # ~(floor + NUM_KV_SPLITS - 1)/floor more work than the others.
-    kv_len_per_split = cur_batch_seq_len // NUM_KV_SPLITS
-    split_kv_start = kv_len_per_split * split_kv_id
-    split_kv_end = split_kv_start + kv_len_per_split
-    if split_kv_id == NUM_KV_SPLITS - 1:
-        split_kv_end = cur_batch_seq_len
+    #
+    # DYNAMIC_KV_SPLITS: NUM_KV_SPLITS is launched at a fixed, seq-independent
+    # budget (so CUDA Graph capture cannot freeze it), while the *active* split
+    # count is derived from the runtime per-batch KV length read from B_seq_len.
+    # active=min(budget,cdiv(seq,BLOCK_N)); stage-2 mirrors this policy.
+    active_kv_splits = NUM_KV_SPLITS
+    if DYNAMIC_KV_SPLITS:
+        active_kv_splits = gl.maximum(
+            1, gl.minimum(gl.cdiv(cur_batch_seq_len, BLOCK_N), NUM_KV_SPLITS)
+        )
+        if split_kv_id >= active_kv_splits:
+            return
+    if BLOCK_BALANCED_SPLITS:
+        # Balance whole KV tiles so internal split boundaries do not create a
+        # partial BLOCK_N tile in every workgroup.
+        num_kv_blocks = gl.cdiv(cur_batch_seq_len, BLOCK_N)
+        blocks_per_split = num_kv_blocks // active_kv_splits
+        extra_blocks = num_kv_blocks % active_kv_splits
+        split_block_start = (
+            split_kv_id * blocks_per_split
+            + gl.minimum(split_kv_id, extra_blocks)
+        )
+        split_block_count = blocks_per_split + (split_kv_id < extra_blocks)
+        split_kv_start = split_block_start * BLOCK_N
+        split_kv_end = gl.minimum(
+            split_kv_start + split_block_count * BLOCK_N, cur_batch_seq_len
+        )
+    else:
+        kv_len_per_split = cur_batch_seq_len // active_kv_splits
+        split_kv_start = kv_len_per_split * split_kv_id
+        split_kv_end = split_kv_start + kv_len_per_split
+        if split_kv_id == active_kv_splits - 1:
+            split_kv_end = cur_batch_seq_len
     num_iter = gl.cdiv(split_kv_end - split_kv_start, BLOCK_N)
     start_n = split_kv_start
-
-    # >2GB KV cache (global_load path): widen strides to int64 so kv offsets don't overflow int32.
-    if not WITHIN_2GB:
-        stride_kv_c_bs = stride_kv_c_bs.to(gl.int64)
-        stride_k_pe_bs = stride_k_pe_bs.to(gl.int64)
 
     # early return with empty kv slice to save compute
     if split_kv_start >= split_kv_end:
@@ -177,7 +219,7 @@ def _mla_gluon(
     # [0, seq_len-QLEN+q_pos] only, so score_end is its per-program valid-score
     # bound. For QLEN==1 this equals split_kv_end, keeping the original code
     # path untouched.
-    if QLEN > 1:
+    if QLEN > 1 and REGIME != 'bq64bn128fp8':
         score_end = gl.minimum(split_kv_end, cur_batch_seq_len - QLEN + q_pos + 1)
     else:
         score_end = split_kv_end
@@ -337,7 +379,15 @@ def _mla_gluon(
 
     # linear_v: each regime has unique warp/reg mapping (bh64 has degenerate warp_bases,
     # bh16bn128 has an extra K reg base for the 128-wide K, bh16bn64 has the bh16 warp layout at 64-wide K).
-    if REGIME == 'bh64':
+    if REGIME == 'bq64bn128fp8':
+        linear_v: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (0, 64), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
+            lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
+            warp_bases=((0, 0), (0, 0)),
+            block_bases=[],
+            shape=[512, 128],
+        )
+    elif REGIME == 'bh64':
         linear_v: gl.constexpr = gl.DistributedLinearLayout(
             reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
             lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
@@ -362,35 +412,185 @@ def _mla_gluon(
             shape=[512, 64],
         )
 
-    mfma_layout_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=8)
-    mfma_layout_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=8)
+    QK_K_WIDTH: gl.constexpr = 16 if REGIME == 'bq64bn128fp8' else 8
+    mfma_qk_layout_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=QK_K_WIDTH)
+    mfma_qk_layout_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=QK_K_WIDTH)
+    if REGIME == 'bq64bn128fp8':
+        mfma_scaled_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 128],
+            transposed=True,
+            warps_per_cta=[4, 1],
+        )
+        online_layout: gl.constexpr = mfma_scaled_layout
+
+        # Both logical row groups shard N identically across the four waves.
+        # Group A carries two M tiles per wave while group B carries one, so a
+        # single resident K/KPE/V dot-B operand can feed both groups.
+        group_a_qk_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 32],
+            transposed=True,
+            warps_per_cta=[1, 4],
+        )
+        group_a_qk_layout_a: gl.constexpr = gl.DotOperandLayout(
+            operand_index=0, parent=group_a_qk_layout, k_width=QK_K_WIDTH)
+        group_a_qk_layout_b: gl.constexpr = gl.DotOperandLayout(
+            operand_index=1, parent=group_a_qk_layout, k_width=QK_K_WIDTH)
+        group_a_scaled_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 128],
+            transposed=True,
+            warps_per_cta=[1, 4],
+        )
+        group_a_scaled_layout_a: gl.constexpr = gl.DotOperandLayout(
+            operand_index=0, parent=group_a_scaled_layout, k_width=32)
+        group_a_scaled_layout_b: gl.constexpr = gl.DotOperandLayout(
+            operand_index=1, parent=group_a_scaled_layout, k_width=32)
+
+        group_b_qk_layout: gl.constexpr = group_a_qk_layout
+        group_b_qk_layout_a: gl.constexpr = group_a_qk_layout_a
+        group_b_scaled_layout: gl.constexpr = group_a_scaled_layout
+        group_b_scaled_layout_a: gl.constexpr = group_a_scaled_layout_a
+    else:
+        online_layout: gl.constexpr = mfma_layout
+    mfma_pv_layout_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=8)
+    mfma_pv_layout_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=8)
     dtype = Q_nope.type.element_ty
     kvtype = Kv_c_cache.type.element_ty
     ######### layout setting end #########
 
-    buf_q_nope = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_CKV], layout=shared_q_nope)
-    if HAS_PE:
-        buf_q_pe = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_KPE], layout=shared_q_pe)
+    if REGIME != 'bq64bn128fp8':
+        buf_q_nope = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_CKV], layout=shared_q_nope)
+        if HAS_PE:
+            buf_q_pe = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_KPE], layout=shared_q_pe)
 
     # load q_nope
     offs_d_ckv = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, blocked_q_nope))
-    cur_head = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_nope))
-    offs_q_nope = cur_batch * stride_q_nope_bs + q_pos * stride_q_nope_s + cur_head[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
+    q_row = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_nope))
+    if REGIME == 'bq64bn128fp8':
+        cur_head = q_row % 16
+        q_pos_row = q_row // 16
+        valid_q_row = (q_pos_row < QLEN) & (cur_head < NHEAD)
+        offs_q_nope = cur_batch * stride_q_nope_bs + q_pos_row[:, None] * stride_q_nope_s + cur_head[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
+    else:
+        cur_head = cur_head_id * BLOCK_H + q_row
+        valid_q_row = cur_head < NHEAD
+        offs_q_nope = cur_batch * stride_q_nope_bs + q_pos * stride_q_nope_s + cur_head[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
     ### For nhead < BLOCK_H, mask OOB heads to zero on Q load and skip OOB O stores; wasted MFMA lanes are free (memory-bound).
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope, mask = (cur_head < NHEAD)[:, None] if NHEAD % BLOCK_H != 0 else None)
-    gl.amd.cdna4.async_copy.commit_group()
+    if REGIME == 'bq64bn128fp8':
+        q_nope_reg = gl.amd.cdna4.buffer_load(
+            ptr=Q_nope, offsets=offs_q_nope, mask=valid_q_row[:, None])
+    elif NHEAD % BLOCK_H != 0:
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope, mask=valid_q_row[:, None])
+        gl.amd.cdna4.async_copy.commit_group()
+    else:
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope)
+        gl.amd.cdna4.async_copy.commit_group()
 
     # load q_pe
     if HAS_PE:
         offs_d_kpe = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(0, blocked_q_pe))
-        cur_head_qpe = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_pe))
-        offs_q_pe = cur_batch * stride_q_pe_bs + q_pos * stride_q_pe_s + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe, mask = (cur_head_qpe < NHEAD)[:, None] if NHEAD % BLOCK_H != 0 else None)
-        gl.amd.cdna4.async_copy.commit_group()
+        q_row_qpe = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_pe))
+        if REGIME == 'bq64bn128fp8':
+            cur_head_qpe = q_row_qpe % 16
+            q_pos_row_qpe = q_row_qpe // 16
+            valid_q_row_qpe = (q_pos_row_qpe < QLEN) & (cur_head_qpe < NHEAD)
+            offs_q_pe = cur_batch * stride_q_pe_bs + q_pos_row_qpe[:, None] * stride_q_pe_s + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
+        else:
+            cur_head_qpe = cur_head_id * BLOCK_H + q_row_qpe
+            valid_q_row_qpe = cur_head_qpe < NHEAD
+            offs_q_pe = cur_batch * stride_q_pe_bs + q_pos * stride_q_pe_s + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
+        if REGIME == 'bq64bn128fp8':
+            q_pe_reg = gl.amd.cdna4.buffer_load(
+                ptr=Q_pe, offsets=offs_q_pe, mask=valid_q_row_qpe[:, None])
+        elif NHEAD % BLOCK_H != 0:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe, mask=valid_q_row_qpe[:, None])
+            gl.amd.cdna4.async_copy.commit_group()
+        else:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe)
+            gl.amd.cdna4.async_copy.commit_group()
 
-    e_max = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout)) - float("inf")
-    e_sum = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout))
-    acc = gl.zeros([BLOCK_H, HEAD_DIM_CKV], dtype=gl.float32, layout=mfma_layout)
+    if REGIME == 'bq64bn128fp8':
+        # Split the already-loaded register tensors by logical row. Reshaping to
+        # put the two-way selector last lets gl.split form contiguous row groups
+        # without another global Q read.
+        q_nope_halves = gl.permute(
+            gl.reshape(q_nope_reg, [2, 32, HEAD_DIM_CKV]), [1, 2, 0])
+        q_nope_a_reg, q_nope_tail_reg = gl.split(q_nope_halves)
+        q_nope_tail_halves = gl.permute(
+            gl.reshape(q_nope_tail_reg, [2, 16, HEAD_DIM_CKV]), [1, 2, 0])
+        q_nope_b_reg, _q_nope_pad_reg = gl.split(q_nope_tail_halves)
+        # Pack the logical 32-row and 16-row views directly for their native
+        # FP8 QK MFMAs.  The masked fourth q-position remains absent.
+        q_nope_a = gl.convert_layout(
+            q_nope_a_reg.to(kvtype), group_a_scaled_layout_a)
+        q_nope_b = gl.convert_layout(
+            q_nope_b_reg.to(kvtype), group_b_scaled_layout_a)
+
+        if HAS_PE:
+            q_pe_halves = gl.permute(
+                gl.reshape(q_pe_reg, [2, 32, HEAD_DIM_KPE]), [1, 2, 0])
+            q_pe_a_reg, q_pe_tail_reg = gl.split(q_pe_halves)
+            q_pe_tail_halves = gl.permute(
+                gl.reshape(q_pe_tail_reg, [2, 16, HEAD_DIM_KPE]), [1, 2, 0])
+            # This selector is lane-derived in blocked_q_pe, so a second split
+            # cannot infer its result layout.  Fold q_pos 2 with the masked-zero
+            # q_pos 3 padding instead; the resulting [16, KPE] view is identical.
+            q_pe_b_reg = gl.sum(q_pe_tail_halves, axis=2)
+            q_pe_a = gl.convert_layout(
+                q_pe_a_reg.to(kvtype), group_a_qk_layout_a)
+            q_pe_b = gl.convert_layout(
+                q_pe_b_reg.to(kvtype), group_b_qk_layout_a)
+
+        group_a_e_max = gl.zeros(
+            [32], dtype=gl.float32,
+            layout=gl.SliceLayout(1, group_a_scaled_layout)) - float("inf")
+        group_a_e_sum = gl.zeros(
+            [32], dtype=gl.float32,
+            layout=gl.SliceLayout(1, group_a_scaled_layout))
+        group_a_acc = gl.zeros(
+            [32, HEAD_DIM_CKV], dtype=gl.float32,
+            layout=group_a_scaled_layout)
+        group_b_e_max = gl.zeros(
+            [16], dtype=gl.float32,
+            layout=gl.SliceLayout(1, group_b_scaled_layout)) - float("inf")
+        group_b_e_sum = gl.zeros(
+            [16], dtype=gl.float32,
+            layout=gl.SliceLayout(1, group_b_scaled_layout))
+        group_b_acc = gl.zeros(
+            [16, HEAD_DIM_CKV], dtype=gl.float32,
+            layout=group_b_scaled_layout)
+
+        # Derive causal metadata from each group's global padded row.  Group A
+        # owns q positions 0/1 and group B owns q position 2; neither carries
+        # the empty q-position-3 tile through its online state.
+        group_a_qk_col = gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, group_a_scaled_layout))
+        group_a_qk_row = gl.arange(
+            0, 32, layout=gl.SliceLayout(1, group_a_scaled_layout))
+        group_a_qk_pos = group_a_qk_row // 16
+        group_a_qk_head = group_a_qk_row % 16
+        group_a_qk_score_end = gl.minimum(
+            split_kv_end, cur_batch_seq_len - QLEN + group_a_qk_pos + 1)
+        group_a_qk_valid_row = (
+            (group_a_qk_pos < QLEN) & (group_a_qk_head < NHEAD))
+
+        group_b_qk_col = gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, group_b_scaled_layout))
+        group_b_qk_row = gl.arange(
+            0, 16, layout=gl.SliceLayout(1, group_b_scaled_layout)) + 32
+        group_b_qk_pos = group_b_qk_row // 16
+        group_b_qk_head = group_b_qk_row % 16
+        group_b_qk_score_end = gl.minimum(
+            split_kv_end, cur_batch_seq_len - QLEN + group_b_qk_pos + 1)
+        group_b_qk_valid_row = (
+            (group_b_qk_pos < QLEN) & (group_b_qk_head < NHEAD))
+
+    if REGIME != 'bq64bn128fp8':
+        e_max = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, online_layout)) - float("inf")
+        e_sum = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, online_layout))
+        acc = gl.zeros([BLOCK_H, HEAD_DIM_CKV], dtype=gl.float32, layout=mfma_layout)
 
     # Fold KV dequant scale into the QK temperature. For fp8 KV the real
     # logits are (Q @ K_fp8^T) * kv_scale * sm_scale; softmax is shift- but
@@ -420,10 +620,11 @@ def _mla_gluon(
     gl.amd.cdna4.async_copy.commit_group()
 
     #### local load Q
-    gl.amd.cdna4.async_copy.wait_group(2)
-    q_nope = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_nope, mfma_layout_a)
-    if HAS_PE:
-        q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe, mfma_layout_a)
+    if REGIME != 'bq64bn128fp8':
+        gl.amd.cdna4.async_copy.wait_group(2)
+        q_nope = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_nope, mfma_qk_layout_a)
+    if HAS_PE and REGIME != 'bq64bn128fp8':
+        q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe, mfma_qk_layout_a)
 
     #################### move here to work around allocate_shared_memory bug
     bufs_kv = gl.allocate_shared_memory(kvtype, shape=[2, HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
@@ -436,12 +637,18 @@ def _mla_gluon(
     if HAS_PE:
         kv_page_number_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page.index(0), gl.SliceLayout(0, blocked_kpe))
         # simplify for page_size 1
-        kv_loc_pe = kv_page_number_pe
+        kv_loc_pe = (
+            kv_page_number_pe.to(gl.int64)
+            if WIDE_KV_OFFSETS
+            else kv_page_number_pe
+        )
 
     # local load page number for slice 0
     bufs_page_0 = bufs_page.index(0).slice(0, BLOCK_N // 2, 0)
     kv_page_number_0 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_0, gl.SliceLayout(0, blocked_kv_slice))
-    kv_loc0 = kv_page_number_0
+    kv_loc0 = (
+        kv_page_number_0.to(gl.int64) if WIDE_KV_OFFSETS else kv_page_number_0
+    )
 
     # global load K_nope slice 0
     offs_n_nope0 = split_kv_start + gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, blocked_kv_slice))
@@ -468,7 +675,9 @@ def _mla_gluon(
     # local load page number for slice 1
     bufs_page_1 = bufs_page.index(0).slice(BLOCK_N // 2, BLOCK_N // 2, 0)
     kv_page_number_1 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_1, gl.SliceLayout(0, blocked_kv_slice))
-    kv_loc1 = kv_page_number_1
+    kv_loc1 = (
+        kv_page_number_1.to(gl.int64) if WIDE_KV_OFFSETS else kv_page_number_1
+    )
 
     # global load K_nope slice 1
     offs_n_nope1 = offs_n_nope0 + BLOCK_N // 2
@@ -489,7 +698,13 @@ def _mla_gluon(
     for i in range(num_iter - 2):
         async_idx = (buf_idx + 1) % 2
 
-        gl.amd.cdna4.async_copy.wait_group(0)
+        # Retire only the oldest outstanding group, the previous trip's page copy,
+        # which is all the local load just below needs. Outstanding here, oldest
+        # first, are the four (three without PE) that trip committed: page, then
+        # kv0, kpe and kv1, which stay in flight for the loads further down so two
+        # KV blocks are resident at no extra LDS. The prologue leaves the same set
+        # outstanding, so trip 0 accounts the same way.
+        gl.amd.cdna4.async_copy.wait_group(3 if HAS_PE else 2)
         #### global load page number
         offs_n_page = start_n + BLOCK_N + offs_page_raw
         offs_page = batch_page_start + offs_n_page // PAGE_SIZE
@@ -502,7 +717,11 @@ def _mla_gluon(
         # local load page number for slice 0
         bufs_page_0 = bufs_page.index(async_idx).slice(0, BLOCK_N // 2, 0)
         kv_page_number_0 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_0, gl.SliceLayout(0, blocked_kv_slice))
-        kv_loc0 = kv_page_number_0
+        kv_loc0 = (
+            kv_page_number_0.to(gl.int64)
+            if WIDE_KV_OFFSETS
+            else kv_page_number_0
+        )
         # global load K_nope slice 0
         offs_n_nope0 = start_n + gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, blocked_kv_slice))
         offs_d_ckv_10 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv_slice))
@@ -520,7 +739,11 @@ def _mla_gluon(
         # local load page_number_pe
         if HAS_PE:
             kv_page_number_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page.index(async_idx), gl.SliceLayout(0, blocked_kpe))
-            kv_loc_pe = kv_page_number_pe
+            kv_loc_pe = (
+                kv_page_number_pe.to(gl.int64)
+                if WIDE_KV_OFFSETS
+                else kv_page_number_pe
+            )
             # global load K_pe
             offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
             offs_d_kpe_1 = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
@@ -533,17 +756,68 @@ def _mla_gluon(
             gl.amd.cdna4.async_copy.commit_group()
 
         #### dot, softmax, dot (part0)
-        k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), mfma_layout_b)
-        zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
-        qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
+        # Retire the previous trip's kv0 / kpe / kv1, which these local loads read.
+        # Outstanding here, oldest first: prev kv0, prev kpe, prev kv1, this page,
+        # this kv0, this kpe -- so leaving three pending (two without PE) retires
+        # exactly those three and keeps this trip's prefetches in flight through
+        # the MFMA and softmax block.
+        gl.amd.cdna4.async_copy.wait_group(3 if HAS_PE else 2)
+        if REGIME != 'bq64bn128fp8':
+            k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), mfma_qk_layout_b)
+            zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
+            qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
         if HAS_PE:
-            k_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kpe.index(buf_idx), mfma_layout_b)
-            qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
+            if REGIME == 'bq64bn128fp8':
+                # Build the positional seeds in the two logical row groups.
+                # They remain separate so the empty fourth q-position tile is
+                # absent from the hybrid online path introduced incrementally.
+                k_pe_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    bufs_kpe.index(buf_idx), group_a_qk_layout_b)
+                group_a_qk_pe = gl.amd.cdna4.mfma(
+                    q_pe_a, k_pe_a,
+                    gl.zeros([32, BLOCK_N], dtype=gl.float32,
+                             layout=group_a_qk_layout))
+                group_a_qk_seed = gl.convert_layout(
+                    group_a_qk_pe, group_a_scaled_layout)
+                group_b_qk_pe = gl.amd.cdna4.mfma(
+                    q_pe_b, k_pe_a,
+                    gl.zeros([16, BLOCK_N], dtype=gl.float32,
+                             layout=group_b_qk_layout))
+                group_b_qk_seed = gl.convert_layout(
+                    group_b_qk_pe, group_b_scaled_layout)
+            else:
+                k_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    bufs_kpe.index(buf_idx), mfma_qk_layout_b)
+                qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
+        if REGIME == 'bq64bn128fp8':
+            if not HAS_PE:
+                group_a_qk_seed = gl.zeros(
+                    [32, BLOCK_N], dtype=gl.float32,
+                    layout=group_a_scaled_layout)
+                group_b_qk_seed = gl.zeros(
+                    [16, BLOCK_N], dtype=gl.float32,
+                    layout=group_b_scaled_layout)
+            # Accumulate NoPE QK in the hybrid row layouts as the next staged
+            # replacement for the padded H64 online path.
+            k_c_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                bufs_kv.index(buf_idx), group_a_scaled_layout_b)
+            group_a_qk = gl.amd.cdna4.mfma_scaled(
+                a=q_nope_a, a_scale=None, a_format="e4m3",
+                b=k_c_a, b_scale=None, b_format="e4m3",
+                acc=group_a_qk_seed)
+            group_b_qk = gl.amd.cdna4.mfma_scaled(
+                a=q_nope_b, a_scale=None, a_format="e4m3",
+                b=k_c_a, b_scale=None, b_format="e4m3",
+                acc=group_b_qk_seed)
 
         # local load page number for slice 1
         bufs_page_1 = bufs_page.index(async_idx).slice(BLOCK_N // 2, BLOCK_N // 2, 0)
         kv_page_number_1 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_1, gl.SliceLayout(0, blocked_kv_slice))
-        kv_loc1 = kv_page_number_1
+        kv_loc1 = (
+            kv_page_number_1.to(gl.int64)
+            if WIDE_KV_OFFSETS
+            else kv_page_number_1
+        )
         # global load K_nope slice 1
         offs_n1 = offs_n_nope0 + BLOCK_N // 2
         offs_k_c1 = kv_loc1[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
@@ -555,29 +829,80 @@ def _mla_gluon(
         gl.amd.cdna4.async_copy.commit_group()
 
         #### dot, softmax, dot (part1)
-        qk *= qk_scale
-        offs_n_qk = split_kv_start + i * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
-        qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
-        n_e_max = gl.maximum(gl.max(qk, 1), e_max)
-        LOG2E: gl.constexpr = 1.4426950408889634
-        re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
-        p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
-        if QLEN > 1:
-            # MTP: a leading/whole fully-masked split keeps e_max=n_e_max=-inf,
-            # making re_scale/p NaN. Force them to 0 so the split cleanly yields
-            # e_sum=0 -> lse=-inf, which stage-2 drops.
-            re_scale = gl.where(e_max == float("-inf"), 0.0, re_scale)
-            p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
-        e_sum = e_sum * re_scale + gl.sum(p, 1)
-        e_max = n_e_max
-        p = p.to(dtype)
-        p = gl.convert_layout(p, mfma_layout_a)
-        acc *= re_scale[:, None]
-        v_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), linear_v)
-        v_c = v_c.to(dtype)
-        v_c = gl.permute(v_c, [1, 0])
-        v_c = gl.convert_layout(v_c, mfma_layout_b)
-        acc = gl.amd.cdna4.mfma(p, v_c, acc)
+        if REGIME == 'bq64bn128fp8':
+            # The loop excludes the final two tiles.  Since QLEN <= 4 and
+            # BLOCK_N == 128, its tiles cannot intersect the causal tail; both
+            # potentially partial/boundary tiles remain masked in the epilogues.
+            group_a_tile_e_max = gl.max(group_a_qk, 1) * qk_scale
+            group_a_n_e_max = gl.maximum(
+                group_a_tile_e_max, group_a_e_max)
+            group_a_re_scale = gl.exp2(
+                (group_a_e_max - group_a_n_e_max) * 1.4426950408889634)
+            group_a_p = gl.exp2(
+                group_a_qk * (qk_scale * 1.4426950408889634)
+                - group_a_n_e_max[:, None] * 1.4426950408889634)
+            group_a_e_sum = (
+                group_a_e_sum * group_a_re_scale + gl.sum(group_a_p, 1))
+            group_a_e_max = group_a_n_e_max
+
+            group_b_tile_e_max = gl.max(group_b_qk, 1) * qk_scale
+            group_b_n_e_max = gl.maximum(
+                group_b_tile_e_max, group_b_e_max)
+            group_b_re_scale = gl.exp2(
+                (group_b_e_max - group_b_n_e_max) * 1.4426950408889634)
+            group_b_p = gl.exp2(
+                group_b_qk * (qk_scale * 1.4426950408889634)
+                - group_b_n_e_max[:, None] * 1.4426950408889634)
+            group_b_e_sum = (
+                group_b_e_sum * group_b_re_scale + gl.sum(group_b_p, 1))
+            group_b_e_max = group_b_n_e_max
+
+            # Stage the native K128 FP8 PV in the logical row groups.  Both
+            # groups consume the same resident V tile before its LDS refill,
+            # retaining cross-q-position KV reuse without carrying q_pos 3.
+            group_a_p = gl.convert_layout(
+                group_a_p.to(kvtype), group_a_scaled_layout_a)
+            group_a_acc *= group_a_re_scale[:, None]
+            group_a_v = bufs_kv.index(buf_idx).permute([1, 0]).load(
+                layout=group_a_scaled_layout_b)
+            group_a_acc = gl.amd.cdna4.mfma_scaled(
+                a=group_a_p, a_scale=None, a_format="e4m3",
+                b=group_a_v, b_scale=None, b_format="e4m3",
+                acc=group_a_acc)
+
+            group_b_p = gl.convert_layout(
+                group_b_p.to(kvtype), group_b_scaled_layout_a)
+            group_b_acc *= group_b_re_scale[:, None]
+            group_b_acc = gl.amd.cdna4.mfma_scaled(
+                a=group_b_p, a_scale=None, a_format="e4m3",
+                b=group_a_v, b_scale=None, b_format="e4m3",
+                acc=group_b_acc)
+
+        # The grouped path is now authoritative, so do not carry the old padded
+        # H64 online state through the long steady-state loop.
+        if REGIME != 'bq64bn128fp8':
+            qk *= qk_scale
+            offs_n_qk = split_kv_start + i * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, online_layout))
+            qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
+            tile_e_max = gl.max(qk, 1)
+            n_e_max = gl.maximum(tile_e_max, e_max)
+            LOG2E: gl.constexpr = 1.4426950408889634
+            re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
+            p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
+            if QLEN > 1:
+                # MTP: a leading/whole fully-masked split keeps e_max=n_e_max=-inf,
+                # making re_scale/p NaN. Force them to 0 so the split cleanly yields
+                # e_sum=0 -> lse=-inf, which stage-2 drops.
+                re_scale = gl.where(e_max == float("-inf"), 0.0, re_scale)
+                p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
+            e_sum = e_sum * re_scale + gl.sum(p, 1)
+            e_max = n_e_max
+            p = gl.convert_layout(p.to(dtype), mfma_pv_layout_a)
+            acc *= re_scale[:, None]
+            v_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), linear_v)
+            v_c = gl.permute(v_c, [1, 0])
+            v_c = gl.convert_layout(v_c.to(dtype), mfma_pv_layout_b)
+            acc = gl.amd.cdna4.mfma(p, v_c, acc)
 
         start_n += BLOCK_N
         buf_idx = (buf_idx + 1) % 2
@@ -595,10 +920,14 @@ def _mla_gluon(
         # local load page number
         gl.amd.cdna4.async_copy.wait_group(3 if HAS_PE else 2)
         kv_page_number = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page.index(async_idx), gl.SliceLayout(0, blocked_kv))
-        kv_loc = kv_page_number
+        kv_loc = kv_page_number.to(gl.int64) if WIDE_KV_OFFSETS else kv_page_number
         if HAS_PE:
             kv_page_number_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page.index(async_idx), gl.SliceLayout(0, blocked_kpe))
-            kv_loc_pe = kv_page_number_pe
+            kv_loc_pe = (
+                kv_page_number_pe.to(gl.int64)
+                if WIDE_KV_OFFSETS
+                else kv_page_number_pe
+            )
         # global load K_nope
         offs_n_nope = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kv))
         offs_d_ckv_1 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv))
@@ -622,32 +951,131 @@ def _mla_gluon(
 
         # dot, softmax, dot
         gl.amd.cdna4.async_copy.wait_group(2 if HAS_PE else 1)
-        k_c = bufs_kv.index(buf_idx).load(layout=mfma_layout_b)
-        zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
-        qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
+        if REGIME != 'bq64bn128fp8':
+            k_c = bufs_kv.index(buf_idx).load(layout=mfma_qk_layout_b)
+            zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
+            qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
 
         if HAS_PE:
-            k_pe = bufs_kpe.index(buf_idx).load(layout=mfma_layout_b)
-            qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
-        qk *= qk_scale
-        offs_n_qk = split_kv_start + (num_iter - 2) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
-        qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
-        n_e_max = gl.maximum(gl.max(qk, 1), e_max)
-        re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
-        p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
-        if QLEN > 1:
-            re_scale = gl.where(e_max == float("-inf"), 0.0, re_scale)
-            p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
-        e_sum = e_sum * re_scale + gl.sum(p, 1)
-        e_max = n_e_max
-        p = p.to(dtype)
-        p = gl.convert_layout(p, mfma_layout_a)
-        acc *= re_scale[:, None]
-        v_c = bufs_kv.index(buf_idx).load(layout=linear_v)
-        v_c = v_c.to(dtype)
-        v_c = gl.permute(v_c, [1, 0])
-        v_c = gl.convert_layout(v_c, mfma_layout_b)
-        acc = gl.amd.cdna4.mfma(p, v_c, acc)
+            if REGIME == 'bq64bn128fp8':
+                k_pe_a = bufs_kpe.index(buf_idx).load(
+                    layout=group_a_qk_layout_b)
+                group_a_qk_pe = gl.amd.cdna4.mfma(
+                    q_pe_a, k_pe_a,
+                    gl.zeros([32, BLOCK_N], dtype=gl.float32,
+                             layout=group_a_qk_layout))
+                group_a_qk_seed = gl.convert_layout(
+                    group_a_qk_pe, group_a_scaled_layout)
+                group_b_qk_pe = gl.amd.cdna4.mfma(
+                    q_pe_b, k_pe_a,
+                    gl.zeros([16, BLOCK_N], dtype=gl.float32,
+                             layout=group_b_qk_layout))
+                group_b_qk_seed = gl.convert_layout(
+                    group_b_qk_pe, group_b_scaled_layout)
+            else:
+                k_pe = bufs_kpe.index(buf_idx).load(layout=mfma_qk_layout_b)
+                qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
+        if REGIME == 'bq64bn128fp8':
+            if not HAS_PE:
+                group_a_qk_seed = gl.zeros(
+                    [32, BLOCK_N], dtype=gl.float32,
+                    layout=group_a_scaled_layout)
+                group_b_qk_seed = gl.zeros(
+                    [16, BLOCK_N], dtype=gl.float32,
+                    layout=group_b_scaled_layout)
+            k_c_a = bufs_kv.index(buf_idx).load(
+                layout=group_a_scaled_layout_b)
+            group_a_qk = gl.amd.cdna4.mfma_scaled(
+                a=q_nope_a, a_scale=None, a_format="e4m3",
+                b=k_c_a, b_scale=None, b_format="e4m3",
+                acc=group_a_qk_seed)
+            group_b_qk = gl.amd.cdna4.mfma_scaled(
+                a=q_nope_b, a_scale=None, a_format="e4m3",
+                b=k_c_a, b_scale=None, b_format="e4m3",
+                acc=group_b_qk_seed)
+        if REGIME == 'bq64bn128fp8':
+            group_a_offs_n_qk = (
+                split_kv_start + (num_iter - 2) * BLOCK_N + group_a_qk_col)
+            group_a_qk = gl.where(
+                group_a_qk_valid_row[:, None]
+                & (group_a_offs_n_qk[None, :] < group_a_qk_score_end[:, None]),
+                group_a_qk, float("-inf"))
+            group_a_tile_e_max = gl.max(group_a_qk, 1) * qk_scale
+            group_a_n_e_max = gl.maximum(
+                group_a_tile_e_max, group_a_e_max)
+            group_a_re_scale = gl.exp2(
+                (group_a_e_max - group_a_n_e_max) * LOG2E)
+            group_a_p = gl.exp2(
+                group_a_qk * (qk_scale * LOG2E)
+                - group_a_n_e_max[:, None] * LOG2E)
+            if QLEN > 1:
+                group_a_re_scale = gl.where(
+                    group_a_e_max == float("-inf"), 0.0, group_a_re_scale)
+                group_a_p = gl.where(
+                    group_a_n_e_max[:, None] == float("-inf"), 0.0, group_a_p)
+            group_a_e_sum = (
+                group_a_e_sum * group_a_re_scale + gl.sum(group_a_p, 1))
+            group_a_e_max = group_a_n_e_max
+
+            group_b_offs_n_qk = (
+                split_kv_start + (num_iter - 2) * BLOCK_N + group_b_qk_col)
+            group_b_qk = gl.where(
+                group_b_qk_valid_row[:, None]
+                & (group_b_offs_n_qk[None, :] < group_b_qk_score_end[:, None]),
+                group_b_qk, float("-inf"))
+            group_b_tile_e_max = gl.max(group_b_qk, 1) * qk_scale
+            group_b_n_e_max = gl.maximum(
+                group_b_tile_e_max, group_b_e_max)
+            group_b_re_scale = gl.exp2(
+                (group_b_e_max - group_b_n_e_max) * LOG2E)
+            group_b_p = gl.exp2(
+                group_b_qk * (qk_scale * LOG2E)
+                - group_b_n_e_max[:, None] * LOG2E)
+            if QLEN > 1:
+                group_b_re_scale = gl.where(
+                    group_b_e_max == float("-inf"), 0.0, group_b_re_scale)
+                group_b_p = gl.where(
+                    group_b_n_e_max[:, None] == float("-inf"), 0.0, group_b_p)
+            group_b_e_sum = (
+                group_b_e_sum * group_b_re_scale + gl.sum(group_b_p, 1))
+            group_b_e_max = group_b_n_e_max
+
+            group_a_p = gl.convert_layout(
+                group_a_p.to(kvtype), group_a_scaled_layout_a)
+            group_a_acc *= group_a_re_scale[:, None]
+            group_a_v = bufs_kv.index(buf_idx).permute([1, 0]).load(
+                layout=group_a_scaled_layout_b)
+            group_a_acc = gl.amd.cdna4.mfma_scaled(
+                a=group_a_p, a_scale=None, a_format="e4m3",
+                b=group_a_v, b_scale=None, b_format="e4m3",
+                acc=group_a_acc)
+
+            group_b_p = gl.convert_layout(
+                group_b_p.to(kvtype), group_b_scaled_layout_a)
+            group_b_acc *= group_b_re_scale[:, None]
+            group_b_acc = gl.amd.cdna4.mfma_scaled(
+                a=group_b_p, a_scale=None, a_format="e4m3",
+                b=group_a_v, b_scale=None, b_format="e4m3",
+                acc=group_b_acc)
+        if REGIME != 'bq64bn128fp8':
+            qk *= qk_scale
+            offs_n_qk = split_kv_start + (num_iter - 2) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, online_layout))
+            qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
+            tile_e_max = gl.max(qk, 1)
+            n_e_max = gl.maximum(tile_e_max, e_max)
+            re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
+            p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
+            if QLEN > 1:
+                re_scale = gl.where(e_max == float("-inf"), 0.0, re_scale)
+                p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
+            e_sum = e_sum * re_scale + gl.sum(p, 1)
+            e_max = n_e_max
+            p = gl.convert_layout(p.to(dtype), mfma_pv_layout_a)
+            acc *= re_scale[:, None]
+            v_c = bufs_kv.index(buf_idx).load(layout=linear_v)
+            v_c = gl.permute(v_c, [1, 0])
+            v_c = gl.convert_layout(v_c.to(dtype), mfma_pv_layout_b)
+            acc = gl.amd.cdna4.mfma(p, v_c, acc)
 
         start_n += BLOCK_N
         buf_idx = (buf_idx + 1) % 2
@@ -655,79 +1083,304 @@ def _mla_gluon(
     ################ epilogue 2
     #### dot, softmax, dot
     gl.amd.cdna4.async_copy.wait_group(0)
-    k_c = bufs_kv.index(buf_idx).load(layout=mfma_layout_b)
-    zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
-    qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
+    if REGIME != 'bq64bn128fp8':
+        k_c = bufs_kv.index(buf_idx).load(layout=mfma_qk_layout_b)
+        zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
+        qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
 
     if HAS_PE:
-        k_pe = bufs_kpe.index(buf_idx).load(layout=mfma_layout_b)
-        qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
-    qk *= qk_scale
-    offs_n_qk = split_kv_start + (num_iter - 1) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
-    qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
-    n_e_max = gl.maximum(gl.max(qk, 1), e_max)
-    re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
-    p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
-    if QLEN > 1:
-        re_scale = gl.where(e_max == float("-inf"), 0.0, re_scale)
-        p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
-    e_sum = e_sum * re_scale + gl.sum(p, 1)
-    e_max = n_e_max
-    p = p.to(dtype)
-    p = gl.convert_layout(p, mfma_layout_a)
-    acc *= re_scale[:, None]
-    v_c = bufs_kv.index(buf_idx).load(layout=linear_v)
-    v_c = v_c.to(dtype)
-    v_c = gl.permute(v_c, [1, 0])
-    v_c = gl.convert_layout(v_c, mfma_layout_b)
-    acc = gl.amd.cdna4.mfma(p, v_c, acc)
-
-    cur_head_o = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout))
-    offs_d_ckv_o = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, mfma_layout))
-    offs_o = cur_batch * stride_o_b + q_pos * stride_o_s + cur_head_o[:, None] * stride_o_h + split_kv_id * stride_o_split + offs_d_ckv_o[None, :]
-
-    if HAS_ATTN_SINK:
-        # Fold the optional per-head sink into the softmax denom (no V contribution).
-        # e_max/e_sum are natural-log units (the *LOG2E is inside exp2), so is sink.
-        if NHEAD % BLOCK_H != 0:
-            sink = gl.load(Attn_sink + cur_head_o, mask=cur_head_o < NHEAD, other=float("-inf")).to(gl.float32)
+        if REGIME == 'bq64bn128fp8':
+            k_pe_a = bufs_kpe.index(buf_idx).load(
+                layout=group_a_qk_layout_b)
+            group_a_qk_pe = gl.amd.cdna4.mfma(
+                q_pe_a, k_pe_a,
+                gl.zeros([32, BLOCK_N], dtype=gl.float32,
+                         layout=group_a_qk_layout))
+            group_a_qk_seed = gl.convert_layout(
+                group_a_qk_pe, group_a_scaled_layout)
+            group_b_qk_pe = gl.amd.cdna4.mfma(
+                q_pe_b, k_pe_a,
+                gl.zeros([16, BLOCK_N], dtype=gl.float32,
+                         layout=group_b_qk_layout))
+            group_b_qk_seed = gl.convert_layout(
+                group_b_qk_pe, group_b_scaled_layout)
         else:
-            sink = gl.load(Attn_sink + cur_head_o).to(gl.float32)
-        n_e_max = gl.maximum(e_max, sink)
-        re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
-        acc *= re_scale[:, None]
-        e_sum = e_sum * re_scale + gl.exp2((sink - n_e_max) * LOG2E)
-        e_max = n_e_max
+            k_pe = bufs_kpe.index(buf_idx).load(layout=mfma_qk_layout_b)
+            qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
+    if REGIME == 'bq64bn128fp8':
+        if not HAS_PE:
+            group_a_qk_seed = gl.zeros(
+                [32, BLOCK_N], dtype=gl.float32,
+                layout=group_a_scaled_layout)
+            group_b_qk_seed = gl.zeros(
+                [16, BLOCK_N], dtype=gl.float32,
+                layout=group_b_scaled_layout)
+        k_c_a = bufs_kv.index(buf_idx).load(
+            layout=group_a_scaled_layout_b)
+        group_a_qk = gl.amd.cdna4.mfma_scaled(
+            a=q_nope_a, a_scale=None, a_format="e4m3",
+            b=k_c_a, b_scale=None, b_format="e4m3",
+            acc=group_a_qk_seed)
+        group_b_qk = gl.amd.cdna4.mfma_scaled(
+            a=q_nope_b, a_scale=None, a_format="e4m3",
+            b=k_c_a, b_scale=None, b_format="e4m3",
+            acc=group_b_qk_seed)
+    if REGIME == 'bq64bn128fp8':
+        group_a_offs_n_qk = (
+            split_kv_start + (num_iter - 1) * BLOCK_N + group_a_qk_col)
+        group_a_qk = gl.where(
+            group_a_qk_valid_row[:, None]
+            & (group_a_offs_n_qk[None, :] < group_a_qk_score_end[:, None]),
+            group_a_qk, float("-inf"))
+        group_a_tile_e_max = gl.max(group_a_qk, 1) * qk_scale
+        group_a_n_e_max = gl.maximum(group_a_tile_e_max, group_a_e_max)
+        group_a_re_scale = gl.exp2(
+            (group_a_e_max - group_a_n_e_max) * LOG2E)
+        group_a_p = gl.exp2(
+            group_a_qk * (qk_scale * LOG2E)
+            - group_a_n_e_max[:, None] * LOG2E)
+        if QLEN > 1:
+            group_a_re_scale = gl.where(
+                group_a_e_max == float("-inf"), 0.0, group_a_re_scale)
+            group_a_p = gl.where(
+                group_a_n_e_max[:, None] == float("-inf"), 0.0, group_a_p)
+        group_a_e_sum = (
+            group_a_e_sum * group_a_re_scale + gl.sum(group_a_p, 1))
+        group_a_e_max = group_a_n_e_max
 
-    acc *= kv_scale
-    rcp = 1.0 / e_sum
-    stored_value = (acc * rcp[:, None]).to(dtype)
-    if NHEAD % BLOCK_H != 0:
-        gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=(cur_head_o < NHEAD)[:, None])
+        group_b_offs_n_qk = (
+            split_kv_start + (num_iter - 1) * BLOCK_N + group_b_qk_col)
+        group_b_qk = gl.where(
+            group_b_qk_valid_row[:, None]
+            & (group_b_offs_n_qk[None, :] < group_b_qk_score_end[:, None]),
+            group_b_qk, float("-inf"))
+        group_b_tile_e_max = gl.max(group_b_qk, 1) * qk_scale
+        group_b_n_e_max = gl.maximum(group_b_tile_e_max, group_b_e_max)
+        group_b_re_scale = gl.exp2(
+            (group_b_e_max - group_b_n_e_max) * LOG2E)
+        group_b_p = gl.exp2(
+            group_b_qk * (qk_scale * LOG2E)
+            - group_b_n_e_max[:, None] * LOG2E)
+        if QLEN > 1:
+            group_b_re_scale = gl.where(
+                group_b_e_max == float("-inf"), 0.0, group_b_re_scale)
+            group_b_p = gl.where(
+                group_b_n_e_max[:, None] == float("-inf"), 0.0, group_b_p)
+        group_b_e_sum = (
+            group_b_e_sum * group_b_re_scale + gl.sum(group_b_p, 1))
+        group_b_e_max = group_b_n_e_max
+
+        group_a_p = gl.convert_layout(
+            group_a_p.to(kvtype), group_a_scaled_layout_a)
+        group_a_acc *= group_a_re_scale[:, None]
+        group_a_v = bufs_kv.index(buf_idx).permute([1, 0]).load(
+            layout=group_a_scaled_layout_b)
+        group_a_acc = gl.amd.cdna4.mfma_scaled(
+            a=group_a_p, a_scale=None, a_format="e4m3",
+            b=group_a_v, b_scale=None, b_format="e4m3",
+            acc=group_a_acc)
+
+        group_b_p = gl.convert_layout(
+            group_b_p.to(kvtype), group_b_scaled_layout_a)
+        group_b_acc *= group_b_re_scale[:, None]
+        group_b_acc = gl.amd.cdna4.mfma_scaled(
+            a=group_b_p, a_scale=None, a_format="e4m3",
+            b=group_a_v, b_scale=None, b_format="e4m3",
+            acc=group_b_acc)
+    if REGIME != 'bq64bn128fp8':
+        qk *= qk_scale
+        offs_n_qk = split_kv_start + (num_iter - 1) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, online_layout))
+        qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
+        tile_e_max = gl.max(qk, 1)
+        n_e_max = gl.maximum(tile_e_max, e_max)
+        re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
+        p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
+        if QLEN > 1:
+            re_scale = gl.where(e_max == float("-inf"), 0.0, re_scale)
+            p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
+        e_sum = e_sum * re_scale + gl.sum(p, 1)
+        e_max = n_e_max
+        p = gl.convert_layout(p.to(dtype), mfma_pv_layout_a)
+        acc *= re_scale[:, None]
+        v_c = bufs_kv.index(buf_idx).load(layout=linear_v)
+        v_c = gl.permute(v_c, [1, 0])
+        v_c = gl.convert_layout(v_c.to(dtype), mfma_pv_layout_b)
+        acc = gl.amd.cdna4.mfma(p, v_c, acc)
+
+    if REGIME == 'bq64bn128fp8':
+        group_a_o_row = gl.arange(
+            0, 32, layout=gl.SliceLayout(1, group_a_scaled_layout))
+        group_a_cur_head_o = group_a_o_row % 16
+        group_a_q_pos_o = group_a_o_row // 16
+        group_a_valid_o_row = (
+            (group_a_q_pos_o < QLEN) & (group_a_cur_head_o < NHEAD))
+        group_a_offs_d_o = gl.arange(
+            0, HEAD_DIM_CKV,
+            layout=gl.SliceLayout(0, group_a_scaled_layout))
+        group_a_offs_o = (
+            cur_batch * stride_o_b
+            + group_a_q_pos_o[:, None] * stride_o_s
+            + group_a_cur_head_o[:, None] * stride_o_h
+            + split_kv_id * stride_o_split
+            + group_a_offs_d_o[None, :])
+
+        if HAS_ATTN_SINK:
+            group_a_sink = gl.load(
+                Attn_sink + group_a_cur_head_o,
+                mask=group_a_valid_o_row, other=float("-inf")).to(gl.float32)
+            group_a_n_e_max = gl.maximum(group_a_e_max, group_a_sink)
+            group_a_re_scale = gl.exp2(
+                (group_a_e_max - group_a_n_e_max) * LOG2E)
+            group_a_acc *= group_a_re_scale[:, None]
+            group_a_e_sum = (
+                group_a_e_sum * group_a_re_scale
+                + gl.exp2((group_a_sink - group_a_n_e_max) * LOG2E))
+            group_a_e_max = group_a_n_e_max
+
+        group_a_stored_value = (
+            group_a_acc * (kv_scale / group_a_e_sum)[:, None]).to(dtype)
+        gl.amd.cdna4.buffer_store(
+            group_a_stored_value, ptr=O, offsets=group_a_offs_o,
+            mask=group_a_valid_o_row[:, None])
+
+        # Delay group B's address vectors until group A has retired so the two
+        # native MFMA output layouts do not overlap their store-only VGPR state.
+        group_b_o_row = gl.arange(
+            0, 16, layout=gl.SliceLayout(1, group_b_scaled_layout)) + 32
+        group_b_cur_head_o = group_b_o_row % 16
+        group_b_q_pos_o = group_b_o_row // 16
+        group_b_valid_o_row = (
+            (group_b_q_pos_o < QLEN) & (group_b_cur_head_o < NHEAD))
+        group_b_offs_d_o = gl.arange(
+            0, HEAD_DIM_CKV,
+            layout=gl.SliceLayout(0, group_b_scaled_layout))
+        group_b_offs_o = (
+            cur_batch * stride_o_b
+            + group_b_q_pos_o[:, None] * stride_o_s
+            + group_b_cur_head_o[:, None] * stride_o_h
+            + split_kv_id * stride_o_split
+            + group_b_offs_d_o[None, :])
+
+        if HAS_ATTN_SINK:
+            group_b_sink = gl.load(
+                Attn_sink + group_b_cur_head_o,
+                mask=group_b_valid_o_row, other=float("-inf")).to(gl.float32)
+            group_b_n_e_max = gl.maximum(group_b_e_max, group_b_sink)
+            group_b_re_scale = gl.exp2(
+                (group_b_e_max - group_b_n_e_max) * LOG2E)
+            group_b_acc *= group_b_re_scale[:, None]
+            group_b_e_sum = (
+                group_b_e_sum * group_b_re_scale
+                + gl.exp2((group_b_sink - group_b_n_e_max) * LOG2E))
+            group_b_e_max = group_b_n_e_max
+
+        group_b_stored_value = (
+            group_b_acc * (kv_scale / group_b_e_sum)[:, None]).to(dtype)
+        gl.amd.cdna4.buffer_store(
+            group_b_stored_value, ptr=O, offsets=group_b_offs_o,
+            mask=group_b_valid_o_row[:, None])
     else:
-        gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
+        o_row = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout))
+        cur_head_o = cur_head_id * BLOCK_H + o_row
+        q_pos_o = q_pos
+        valid_o_row = cur_head_o < NHEAD
+        offs_o_qh = q_pos_o * stride_o_s + cur_head_o[:, None] * stride_o_h
+        offs_d_ckv_o = gl.arange(
+            0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, mfma_layout))
+        offs_o = (
+            cur_batch * stride_o_b + offs_o_qh
+            + split_kv_id * stride_o_split + offs_d_ckv_o[None, :])
+
+        if HAS_ATTN_SINK:
+            # Fold the optional per-head sink into the softmax denom (no V contribution).
+            # e_max/e_sum are natural-log units (the *LOG2E is inside exp2), so is sink.
+            if NHEAD % BLOCK_H != 0:
+                sink = gl.load(Attn_sink + cur_head_o, mask=cur_head_o < NHEAD, other=float("-inf")).to(gl.float32)
+            else:
+                sink = gl.load(Attn_sink + cur_head_o).to(gl.float32)
+            n_e_max = gl.maximum(e_max, sink)
+            re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
+            acc *= re_scale[:, None]
+            e_sum = e_sum * re_scale + gl.exp2((sink - n_e_max) * LOG2E)
+            e_max = n_e_max
+
+        acc *= kv_scale
+        rcp = 1.0 / e_sum
+        stored_value = (acc * rcp[:, None]).to(dtype)
+        if NHEAD % BLOCK_H != 0:
+            gl.amd.cdna4.buffer_store(
+                stored_value, ptr=O, offsets=offs_o,
+                mask=valid_o_row[:, None])
+        else:
+            gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
 
     ### store lse
     blocked_lse: gl.constexpr = gl.BlockedLayout(size_per_thread=[1], threads_per_warp=[64], warps_per_cta=[4], order=[0])
-    cur_head_lse = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=blocked_lse)
+    lse_row = gl.arange(0, BLOCK_H, layout=blocked_lse)
+    if REGIME == 'bq64bn128fp8':
+        cur_head_lse = lse_row % 16
+        q_pos_lse = lse_row // 16
+        valid_lse_row = (q_pos_lse < QLEN) & (cur_head_lse < NHEAD)
+    else:
+        cur_head_lse = cur_head_id * BLOCK_H + lse_row
+        q_pos_lse = q_pos
+        valid_lse_row = cur_head_lse < NHEAD
     if RETURN_LSE and NUM_KV_SPLITS == 1:
         # split==1: single split is the whole sequence, so its lse is the final lse.
-        offs_final_lse = cur_batch * stride_final_lse_b + q_pos * stride_final_lse_s + cur_head_lse * stride_final_lse_h
-        lse = e_max + gl.log(e_sum)
-        lse = gl.convert_layout(lse, blocked_lse)
-        if NHEAD % BLOCK_H != 0:
-            gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse, mask=(cur_head_lse < NHEAD))
+        if REGIME == 'bq64bn128fp8':
+            group_a_offs_lse = (
+                cur_batch * stride_final_lse_b
+                + group_a_q_pos_o * stride_final_lse_s
+                + group_a_cur_head_o * stride_final_lse_h)
+            group_a_lse = group_a_e_max + gl.log(group_a_e_sum)
+            gl.amd.cdna4.buffer_store(
+                group_a_lse, ptr=Final_lse, offsets=group_a_offs_lse,
+                mask=group_a_valid_o_row)
+            group_b_offs_lse = (
+                cur_batch * stride_final_lse_b
+                + group_b_q_pos_o * stride_final_lse_s
+                + group_b_cur_head_o * stride_final_lse_h)
+            group_b_lse = group_b_e_max + gl.log(group_b_e_sum)
+            gl.amd.cdna4.buffer_store(
+                group_b_lse, ptr=Final_lse, offsets=group_b_offs_lse,
+                mask=group_b_valid_o_row)
         else:
-            gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse)
+            offs_final_lse = cur_batch * stride_final_lse_b + q_pos_lse * stride_final_lse_s + cur_head_lse * stride_final_lse_h
+            lse = e_max + gl.log(e_sum)
+            lse = gl.convert_layout(lse, blocked_lse)
+            if NHEAD % BLOCK_H != 0:
+                gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse, mask=valid_lse_row)
+            else:
+                gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse)
     elif NUM_KV_SPLITS > 1:
         # per-split lse for stage-2 reduce.
-        offs_mid_lse = cur_batch * stride_mid_lse_b + q_pos * stride_mid_lse_s + cur_head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_split
-        lse = e_max + gl.log(e_sum)
-        lse = gl.convert_layout(lse, blocked_lse)
-        if NHEAD % BLOCK_H != 0:
-            gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=(cur_head_lse < NHEAD))
+        if REGIME == 'bq64bn128fp8':
+            group_a_offs_lse = (
+                cur_batch * stride_mid_lse_b
+                + group_a_q_pos_o * stride_mid_lse_s
+                + group_a_cur_head_o * stride_mid_lse_h
+                + split_kv_id * stride_mid_lse_split)
+            group_a_lse = group_a_e_max + gl.log(group_a_e_sum)
+            gl.amd.cdna4.buffer_store(
+                group_a_lse, ptr=Mid_lse, offsets=group_a_offs_lse,
+                mask=group_a_valid_o_row)
+            group_b_offs_lse = (
+                cur_batch * stride_mid_lse_b
+                + group_b_q_pos_o * stride_mid_lse_s
+                + group_b_cur_head_o * stride_mid_lse_h
+                + split_kv_id * stride_mid_lse_split)
+            group_b_lse = group_b_e_max + gl.log(group_b_e_sum)
+            gl.amd.cdna4.buffer_store(
+                group_b_lse, ptr=Mid_lse, offsets=group_b_offs_lse,
+                mask=group_b_valid_o_row)
         else:
-            gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse)
+            offs_mid_lse = cur_batch * stride_mid_lse_b + q_pos_lse * stride_mid_lse_s + cur_head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_split
+            lse = e_max + gl.log(e_sum)
+            lse = gl.convert_layout(lse, blocked_lse)
+            if NHEAD % BLOCK_H != 0:
+                gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=valid_lse_row)
+            else:
+                gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse)
 # fmt: on
 
 
@@ -757,6 +1410,9 @@ def _mla_softmax_reducev_kernel(
     HEAD_DIM_CKV: tl.constexpr,
     HAS_FINAL_LSE: tl.constexpr,
     USE_2D_VIEW: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    DYNAMIC_KV_SPLITS: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -771,30 +1427,58 @@ def _mla_softmax_reducev_kernel(
     else:
         batch_page_start = tl.load(B_seq_len + cur_batch)
         cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - batch_page_start
-    kv_len_per_split = cur_batch_seq_len // NUM_KV_SPLITS
+    # Mirror stage-1's active-split derivation so both stages agree on how many
+    # splits actually hold data (see _mla_gluon). Inactive splits (>= active) were
+    # never written by stage-1; they are masked out of the reduce below.
+    active_kv_splits = NUM_KV_SPLITS
+    if DYNAMIC_KV_SPLITS:
+        active_kv_splits = tl.maximum(
+            1, tl.minimum(tl.cdiv(cur_batch_seq_len, BLOCK_N), NUM_KV_SPLITS)
+        )
+    kv_len_per_split = cur_batch_seq_len // active_kv_splits
 
     offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
-    offs_l = cur_batch * stride_l_b + q_pos * stride_l_qs + cur_head * stride_l_h + offs_d_ckv
-    offs_ml = cur_batch * stride_ml_b + q_pos * stride_ml_qs + cur_head * stride_ml_h
+    offs_s = tl.arange(0, BLOCK_S)
+    base_l = cur_batch * stride_l_b + q_pos * stride_l_qs + cur_head * stride_l_h
+    base_ml = cur_batch * stride_ml_b + q_pos * stride_ml_qs + cur_head * stride_ml_h
 
     e_sum = 0.0
     e_max = -float("inf")
     acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
 
-    LOOP_START = NUM_KV_SPLITS - 1 if kv_len_per_split == 0 else 0
-    for split_kv_id in range(LOOP_START, NUM_KV_SPLITS):
-        logits = tl.load(Logits + offs_l + split_kv_id * stride_l_s)
-        logits_1 = tl.load(Mid_lse + offs_ml + split_kv_id * stride_ml_s)
+    # The split-KV LSE merge is associative, so instead of a serial dependent loop
+    # over NUM_KV_SPLITS (latency-bound on ~batch*nhead workgroups), reduce BLOCK_S
+    # splits at a time as a vectorized [BLOCK_S, HEAD_DIM] tile. This overlaps the
+    # per-split loads and shortens the dependent chain to NUM_KV_SPLITS/BLOCK_S.
+    # Upper bound is active_kv_splits, not the constexpr NUM_KV_SPLITS: under the
+    # dynamic policy active can be far below the launched budget, so bounding by it
+    # collapses the reduce to ceil(active / BLOCK_S) tiles instead of always
+    # sweeping the full budget. Non-dynamic keeps active == NUM_KV_SPLITS (static).
+    LOOP_START = active_kv_splits - 1 if kv_len_per_split == 0 else 0
+    for start in range(LOOP_START, active_kv_splits, BLOCK_S):
+        s_ids = start + offs_s  # [BLOCK_S]
+        s_mask = s_ids < active_kv_splits
+        lse = tl.load(
+            Mid_lse + base_ml + s_ids * stride_ml_s, mask=s_mask, other=-float("inf")
+        )  # [BLOCK_S]
+        logits = tl.load(
+            Logits + base_l + s_ids[:, None] * stride_l_s + offs_d_ckv[None, :],
+            mask=s_mask[:, None],
+            other=0.0,
+        )  # [BLOCK_S, HEAD_DIM_CKV]
 
-        n_e_max = tl.maximum(logits_1, e_max)
+        tile_max = tl.max(lse, axis=0)  # scalar; masked/empty splits are -inf
+        n_e_max = tl.maximum(e_max, tile_max)
         old_scale = tl.where(e_max == -float("inf"), 0.0, tl.exp(e_max - n_e_max))
-        acc *= old_scale
-        exp_logic = tl.where(logits_1 == -float("inf"), 0.0, tl.exp(logits_1 - n_e_max))
-        # MTP: a fully causal-masked split stores NaN logits with lse=-inf; guard
-        # the accumulate so NaN*0 doesn't poison acc (no-op for plain decode).
-        acc += tl.where(logits_1 == -float("inf"), 0.0, exp_logic * logits)
-
-        e_sum = e_sum * old_scale + exp_logic
+        # A fully causal-masked split may carry NaN logits with lse=-inf.  Mask the
+        # payload before multiplication because IEEE 0 * NaN is still NaN.
+        valid_lse = lse != -float("inf")
+        w = tl.where(valid_lse, tl.exp(lse - n_e_max), 0.0)  # [BLOCK_S]
+        contrib = tl.where(
+            valid_lse[:, None], w[:, None] * logits, 0.0
+        )  # [BLOCK_S, HEAD_DIM_CKV]
+        acc = acc * old_scale + tl.sum(contrib, axis=0)
+        e_sum = e_sum * old_scale + tl.sum(w, axis=0)
         e_max = n_e_max
 
     out = acc / e_sum if e_sum > 0.0 else tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
@@ -840,9 +1524,9 @@ def mla_gluon(
     [batch, qlen, nhead, dim]. qlen is a runtime value (one compiled kernel
     serves any qlen). Each query position q_pos attends KV [0, seq_len-qlen+q_pos]
     (causal tail). The plain-decode 3-D path ([batch, nhead, dim], qlen=1) is
-    unchanged. Implementation: q_pos is an extra grid axis, so KV is currently
-    re-read per q_pos, but those re-reads are mostly served from L2/MALL cache so
-    the path is efficient at ctx<=16384.
+    unchanged. The small-head FP8 MTP path fuses up to 64 (q_pos, head) rows in
+    stage-1 so all query positions share each KV tile; other regimes retain the
+    q_pos grid axis.
 
     return_lse=False (default): returns (o, None).
 
@@ -887,9 +1571,19 @@ def mla_gluon(
     if attn_sink is None:
         attn_sink = torch.empty(1, device=o.device, dtype=torch.float32)  # dummy ptr
 
-    # Pick regime by (nhead, kv dtype). MTP (qlen>1) uses the grid-axis path:
-    # q_pos is grid axis 2, so each query position is a separate program.
-    if nhead in (64, 128):
+    # Pick regime by (nhead, kv dtype). Small-head FP8 MTP fuses q positions;
+    # the remaining MTP regimes use q_pos on a grid axis.
+    if (
+        IS_MTP
+        and qlen > 1
+        and batch_size >= 1
+        and qlen <= 4
+        and nhead <= 16
+        and kv_c.dtype == torch.float8_e4m3fn
+        and not has_attn_sink
+    ):
+        REGIME = "bq64bn128fp8"
+    elif nhead in (64, 128):
         REGIME = "bh64"
     elif 1 <= nhead <= 96:
         # bh16 path: heads are tiled into cdiv(nhead, 16) blocks of BLOCK_H=16 on
@@ -911,7 +1605,25 @@ def mla_gluon(
 
     PAGE_SIZE = 1
 
-    if REGIME == "bh64":
+    # Device-side split policy: launch a fixed (graph-stable) split budget and
+    # let the kernels derive the active count from runtime seq_info. Enabled only
+    # where a CUDA-Graph-frozen min_kv_seq_len (vLLM hard-codes it to 1) would
+    # otherwise collapse the split count; see the bh16bn64 low-head branch below.
+    DYNAMIC_KV_SPLITS = False
+    if REGIME == "bq64bn128fp8":
+        BLOCK_H, BLOCK_N = 64, 128
+        NUM_XCDS = 1
+        # Use a context-independent budget so graph capture cannot freeze it.
+        split_budget = 512 if batch_size >= 64 else 256
+        NUM_KV_SPLITS = max(1, split_budget // batch_size)
+        kv_dtype = torch.float8_e4m3fn
+        assert (
+            q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
+        ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
+        assert (
+            kv_c.dtype == kv_dtype and k_pe.dtype == kv_dtype
+        ), f"kv_c/k_pe must be {kv_dtype}, got {kv_c.dtype}/{k_pe.dtype}"
+    elif REGIME == "bh64":
         BLOCK_H, BLOCK_N = 64, 64
         NUM_XCDS = get_num_xcds()
         # Auto-pick NUM_KV_SPLITS so the launch fills ~256 workgroups (one wave on
@@ -952,9 +1664,6 @@ def mla_gluon(
         # that every split is non-empty (floor split size = min_kv_seq_len //
         # NUM_KV_SPLITS >= 1). Each clamp below keeps NUM_KV_SPLITS <= min_kv_seq_len,
         if REGIME == "bh16bn128":
-            assert (
-                batch_size == 1
-            ), f"mla_gluon[bh16bn128] requires batch_size=1, got {batch_size}"
             NUM_KV_SPLITS = max(
                 1, min(256 // (batch_size * qlen * NUM_M_BLOCKS), min_kv_seq_len)
             )
@@ -971,6 +1680,15 @@ def mla_gluon(
                     triton.cdiv(min_kv_seq_len, BLOCK_N),
                 ),
             )
+            if nhead <= BLOCK_H:
+                # Low-head decode (the vLLM CUDA-Graph case): launch the full,
+                # seq-independent workgroup budget so capture cannot freeze the
+                # split count at min_kv_seq_len=1. stage-1/stage-2 derive the
+                # active block-bound count from the runtime per-batch KV length in
+                # seq_info, so short sequences are not over-split (no 1-token
+                # partial blocks) and long sequences still fan out across CUs.
+                NUM_KV_SPLITS = max(1, 256 // (batch_size * qlen * NUM_M_BLOCKS))
+                DYNAMIC_KV_SPLITS = True
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
@@ -980,8 +1698,13 @@ def mla_gluon(
 
     # buffer_load uses scalar base + 32-bit offsets, limiting addressable range.
     # For KV caches > 2 GB the kernel falls back to global_load (64-bit pointers).
-    max_kv_bytes = kv_c.shape[0] * kv_c.stride(0) * kv_c.element_size()
+    max_kv_elems = kv_c.shape[0] * kv_c.stride(0)
+    max_kv_bytes = max_kv_elems * kv_c.element_size()
     within_2gb = max_kv_bytes <= 0x80000000  # 2 GB
+    # The row base is an element offset. Promote only the page-number operand
+    # once the product can exceed int32, rather than widening both strides and
+    # every address expression on the large-cache path.
+    wide_kv_offsets = max_kv_elems > 0x7FFFFFFF
 
     # Normalized Q strides: (batch, q_pos, head). For plain decode (3-D) the
     # q_pos stride is 0 and q_pos is always 0, so the kernel address math is
@@ -1049,6 +1772,8 @@ def mla_gluon(
             triton.cdiv(nhead, BLOCK_H) * qlen,
             (batch_size // NUM_XCDS) * NUM_KV_SPLITS,
         )
+    elif REGIME == "bq64bn128fp8":
+        grid = (batch_size, NUM_KV_SPLITS, 1)
     else:
         # Grid axis 2 carries (head_block, q_pos): cdiv(nhead, BLOCK_H) head blocks
         # times qlen query positions. For nhead <= 16 this is just qlen (one head
@@ -1098,9 +1823,14 @@ def mla_gluon(
         KV_PE_OFFSET=kv_pe_offset,
         USE_2D_VIEW=use_2d_view,
         WITHIN_2GB=within_2gb,
+        WIDE_KV_OFFSETS=wide_kv_offsets,
         NUM_XCDS=NUM_XCDS,
         NHEAD=nhead,
         REGIME=REGIME,
+        DYNAMIC_KV_SPLITS=DYNAMIC_KV_SPLITS,
+        BLOCK_BALANCED_SPLITS=(
+            REGIME == "bq64bn128fp8" and min_kv_seq_len >= NUM_KV_SPLITS * BLOCK_N
+        ),
         RETURN_LSE=return_lse,
         QLEN=qlen,
         HAS_PE=has_pe,
@@ -1139,7 +1869,10 @@ def mla_gluon(
         HEAD_DIM_CKV=head_dim_ckv,
         HAS_FINAL_LSE=return_lse,
         USE_2D_VIEW=use_2d_view,
-        num_warps=8,
+        BLOCK_S=min(64, triton.next_power_of_2(NUM_KV_SPLITS)),
+        BLOCK_N=BLOCK_N,
+        DYNAMIC_KV_SPLITS=DYNAMIC_KV_SPLITS,
+        num_warps=4,
     )
 
     return o, final_lse
