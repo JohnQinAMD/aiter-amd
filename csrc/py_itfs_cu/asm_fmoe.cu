@@ -3,6 +3,7 @@
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "asm_fmoe_configs.hpp"
+#include <cstddef>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <memory>
@@ -66,7 +67,14 @@ struct __attribute__((packed)) KernelArgs
     p3 _p26;
     unsigned int ps_deno;
     p3 _p27;
+    void* ptr_A2;
+    p2 _p28;
+    void* ptr_A2Q;
+    p2 _p29;
 };
+
+static_assert(sizeof(KernelArgs) == 480, "FLAT MoE kernarg ABI must stay 480 bytes");
+static_assert(offsetof(KernelArgs, ptr_A2) == 448, "Unexpected FLAT MoE A2 offset");
 
 class FMoeKernel
 {
@@ -112,7 +120,9 @@ class FMoeKernel
                        aiter_tensor_t* w1_dqn        = nullptr,
                        aiter_tensor_t* w2_dqn        = nullptr,
                        aiter_tensor_t* w2_smooth_qnt = nullptr,
-                       hipStream_t stream         = nullptr)
+                       hipStream_t stream            = nullptr,
+                       aiter_tensor_t* a2             = nullptr,
+                       aiter_tensor_t* a2q            = nullptr)
     {
         int token_cnt       = out->size(0);
         int dim             = w2->size(1);
@@ -142,8 +152,8 @@ class FMoeKernel
             stride_expert_GU *= 2;
         }
 
-        KernelArgs args;
-        size_t arg_size = sizeof(args);
+        KernelArgs args{};
+        size_t arg_size = a2 || a2q ? sizeof(args) : offsetof(KernelArgs, ptr_A2);
         args.ptr_O      = out->ptr;
         args.ptr_X      = input->ptr;
         args.ptr_GU     = w1->ptr;
@@ -182,6 +192,8 @@ class FMoeKernel
         args.topk      = topk;
         args.ps_deno   = ((inter_dim + sub_GU - 1) / sub_GU);
         args.total_tgs = this->num_persistent_tgs / args.ps_deno * args.ps_deno;
+        args.ptr_A2    = a2 ? a2->ptr : nullptr;
+        args.ptr_A2Q   = a2q ? a2q->ptr : nullptr;
 
         int bdx;
         int gdx;
@@ -732,6 +744,127 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                   fc2_scale,
                                   fc2_smooth_scale,
                                   stream);
+}
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    fmoe_g1u1_flat_partials,
+    (
+    aiter_tensor_t* state,             // [token_cnt, dim], FLAT coordination storage
+    aiter_tensor_t* partials,          // [inter_dim / sub_GU, token_cnt, dim]
+    aiter_tensor_t* input,             // [token_cnt, dim]
+    aiter_tensor_t* gate,              // [expert, inter_dim*2, dim]
+    aiter_tensor_t* down,              // [expert, dim, inter_dim]
+    aiter_tensor_t* topk_ids,          // [token_cnt, 1]
+    aiter_tensor_t* topk_weights,      // [token_cnt, 1]
+    aiter_tensor_t* fc1_scale,         // [expert, 1, inter_dim]
+    aiter_tensor_t* fc2_scale,         // [expert, 1, dim]
+    const char* kernel_name,
+    int activation,
+    hipStream_t stream),
+    (state,
+     partials,
+     input,
+     gate,
+     down,
+     topk_ids,
+     topk_weights,
+     fc1_scale,
+     fc2_scale,
+     kernel_name,
+     activation,
+     stream))
+{
+    const HipDeviceGuard device_guard(input->device_id);
+    const ActivationType act = static_cast<ActivationType>(activation);
+    const int model_dim       = down->size(1);
+    const int inter_dim       = down->size(2) * model_dim / gate->size(2);
+    const int sub_X_cnt       = input->size(0);
+    const std::string kernel_name_str = kernel_name ? kernel_name : "";
+
+    AITER_CHECK(!kernel_name_str.empty(), __func__, ": kernel_name is required");
+    AITER_CHECK(get_gpu_arch() == "gfx950",
+                __func__,
+                ": partial-output FLAT kernels require gfx950");
+    AITER_CHECK(act == ActivationType::Silu,
+                __func__,
+                ": partial-output FLAT kernels currently support SiLU only");
+    AITER_CHECK(input->dtype() == AITER_DTYPE_bf16 &&
+                    state->dtype() == AITER_DTYPE_bf16 &&
+                    partials->dtype() == AITER_DTYPE_bf16 &&
+                    gate->dtype() == AITER_DTYPE_fp4x2 &&
+                    down->dtype() == AITER_DTYPE_fp4x2,
+                __func__,
+                ": expected BF16 activations/output and MXFP4 weights");
+    AITER_CHECK(input->dim() == 2 && input->is_contiguous() &&
+                    input->size(1) == model_dim,
+                __func__,
+                ": input must be contiguous [token_cnt, model_dim]");
+    AITER_CHECK(state->dim() == 2 && state->is_contiguous() &&
+                    state->size(0) == input->size(0) && state->size(1) == model_dim,
+                __func__,
+                ": state must be contiguous [token_cnt, model_dim]");
+    AITER_CHECK(topk_ids->dim() == 2 && topk_ids->size(0) == input->size(0) &&
+                    topk_ids->size(1) == 1 && topk_weights->dim() == 2 &&
+                    topk_weights->size(0) == input->size(0) &&
+                    topk_weights->size(1) == 1 && topk_ids->is_contiguous() &&
+                    topk_weights->is_contiguous() && topk_ids->dtype() == AITER_DTYPE_i32 &&
+                    topk_weights->dtype() == AITER_DTYPE_fp32,
+                __func__,
+                ": topk_ids/topk_weights must be contiguous int32/fp32 [token_cnt, 1]");
+
+    FMoeKernel* base = get_heuristic_kernel(inter_dim,
+                                             sub_X_cnt,
+                                             &cfg_fmoe_bf16_pertokenMXfp4_g1u1_silu,
+                                             0,
+                                             kernel_name_str);
+    AITER_CHECK(base->get_flat_mode() == 1,
+                __func__,
+                ": selected kernel is not a FLAT kernel");
+    const int tile = base->get_sub_GU();
+    AITER_CHECK(tile == 32 || tile == 128,
+                __func__,
+                ": only FLAT 16x32 and 16x128 kernels provide partial output; got tile ",
+                tile);
+    AITER_CHECK(inter_dim % tile == 0,
+                __func__,
+                ": inter_dim must be divisible by the selected tile");
+    const int splits = inter_dim / tile;
+    AITER_CHECK(partials->dim() == 3 && partials->is_contiguous() &&
+                    partials->size(0) == splits &&
+                    partials->size(1) == input->size(0) &&
+                    partials->size(2) == model_dim,
+                __func__,
+                ": partials must be contiguous [",
+                splits,
+                ", token_cnt, model_dim]");
+
+    static FMoeKernel partials_32("fmoe_bf16_mxfp4_flat_partials_16x32",
+                                  "fmoe/silu/fmoe_bf16_mxfp4_flat_partials_16x32.co",
+                                  32,
+                                  0,
+                                  1);
+    static FMoeKernel partials_128("fmoe_bf16_mxfp4_flat_partials_16x128",
+                                   "fmoe/silu/fmoe_bf16_mxfp4_flat_partials_16x128.co",
+                                   128,
+                                   0,
+                                   1);
+    FMoeKernel* impl = tile == 32 ? &partials_32 : &partials_128;
+    impl->set_4bit(true);
+    impl->launch_kernel<1, 2>(state,
+                              input,
+                              gate,
+                              down,
+                              topk_ids,
+                              topk_weights,
+                              topk_ids,
+                              topk_ids,
+                              1,
+                              nullptr,
+                              fc1_scale,
+                              fc2_scale,
+                              nullptr,
+                              stream,
+                              partials);
 }
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(

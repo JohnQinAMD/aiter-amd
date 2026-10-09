@@ -215,6 +215,22 @@ def fmoe_g1u1(
 
 
 @compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
+def fmoe_g1u1_flat_partials(
+    state: Tensor,
+    partials: Tensor,
+    input: Tensor,
+    gate: Tensor,
+    down: Tensor,
+    topk_ids: Tensor,
+    topk_weights: Tensor,
+    fc1_scale: Tensor,
+    fc2_scale: Tensor,
+    kernel_name: str,
+    activation: int | None = ActivationType.Silu.value,
+) -> None: ...
+
+
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
 def fmoe_g1u1_tkw1(
     out: Tensor,
     input: Tensor,
