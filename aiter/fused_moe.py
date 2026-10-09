@@ -115,6 +115,43 @@ kernel_bench_callable = None
 # global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
 
 
+def fmoe_g1u1_flat_partials(
+    state: torch.Tensor,
+    partials: torch.Tensor,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    kernel_name: str,
+    activation: ActivationType = ActivationType.Silu,
+) -> torch.Tensor:
+    """Launch a top-k=1 FLAT kernel without its unordered atomic combine.
+
+    ``partials`` has shape ``[inter_dim // tile, rows, model_dim]``. Each split
+    writes one BF16 contribution, so the caller can reduce the first dimension
+    in a fixed order. ``state`` is the kernel's normal output and coordination
+    storage; its backing allocation must include the required eight-byte tail.
+    """
+    aiter.fmoe_g1u1_flat_partials(
+        state,
+        partials,
+        hidden_states,
+        w1,
+        w2,
+        topk_ids,
+        topk_weights,
+        w1_scale,
+        w2_scale,
+        kernel_name,
+        activation,
+    )
+    return partials
+
+
 def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
     device = topk_ids.device
     M = topk_ids.shape[0]
